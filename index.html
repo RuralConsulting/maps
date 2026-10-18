@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<!-- the same protections as _headers, in the page itself, for hosts that can't send headers (GitHub Pages) -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://*.supabase.co https://server.arcgisonline.com https://s3.amazonaws.com https://basemaps.linz.govt.nz; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://server.arcgisonline.com https://s3.amazonaws.com https://basemaps.linz.govt.nz; worker-src 'self' blob:; child-src 'self' blob:; base-uri 'self'; form-action 'self'">
+<script src="guard.js?v=202610182337"></script>
+<title>Farm maps | Rural Consulting</title>
+<link rel="icon" type="image/png" href="brand/icon.png">
+<link rel="apple-touch-icon" href="brand/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Semi+Condensed:wght@600;700&display=swap">
+<link rel="stylesheet" href="lib/maplibre-gl.css">
+<link rel="stylesheet" href="viewer.css?v=202610182337">
+<link rel="stylesheet" href="portal.css?v=202610182337">
+</head>
+<body>
+<main id="screen-signin" class="pt-screen" hidden>
+  <div class="pt-card">
+    <div class="pt-org"><span class="rv-brand"><img class="rv-logo rv-logo-light" src="brand/logo.png" alt="Rural Consulting"><img class="rv-logo rv-logo-dark" src="brand/logo-dark.png" alt="Rural Consulting"></span></div>
+    <h1>Your farm maps</h1>
+    <form id="f-signin" novalidate>
+      <label for="email">Email address</label>
+      <input id="email" type="email" autocomplete="username" inputmode="email" autocapitalize="none" spellcheck="false" required>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" required>
+      <button type="submit">Sign in</button>
+    </form>
+    <p id="msg" class="pt-msg" role="alert"></p>
+    <p class="pt-fine">Access is set up by Rural Consulting. Forgotten your password, or should have access and can't sign in? Contact your RCL consultant and we'll set you a new one.</p>
+  </div>
+</main>
+
+<main id="screen-account" class="pt-screen" hidden>
+  <div class="pt-card">
+    <div class="pt-org"><span class="rv-brand"><img class="rv-logo rv-logo-light" src="brand/logo.png" alt="Rural Consulting"><img class="rv-logo rv-logo-dark" src="brand/logo-dark.png" alt="Rural Consulting"></span></div>
+    <h1>Change password</h1>
+    <form id="f-password" novalidate>
+      <input type="email" id="acct-email" autocomplete="username" hidden>
+      <label for="pw1">New password</label>
+      <input id="pw1" type="password" autocomplete="new-password" minlength="10" required>
+      <label for="pw2">Type it again</label>
+      <input id="pw2" type="password" autocomplete="new-password" minlength="10" required>
+      <p class="pt-help">At least 10 characters. A few words strung together are easy to remember and hard to guess.</p>
+      <button type="submit">Save new password</button>
+      <button type="button" id="b-cancel-pw" class="pt-link">Back to the map</button>
+    </form>
+    <p id="pw-msg" class="pt-msg" role="alert"></p>
+  </div>
+</main>
+
+<main id="screen-list" class="pt-screen" hidden>
+  <div class="pt-card pt-wide">
+    <div class="pt-org"><span class="rv-brand"><img class="rv-logo rv-logo-light" src="brand/logo.png" alt="Rural Consulting"><img class="rv-logo rv-logo-dark" src="brand/logo-dark.png" alt="Rural Consulting"></span><span><button type="button" class="pt-link" id="b-password">Change password</button> · <button type="button" class="pt-link" id="b-signout">Sign out</button></span></div>
+    <button type="button" class="pt-link pt-back" id="b-list-back" hidden>← All properties</button>
+    <h1 id="list-title">Your properties</h1>
+    <div class="pt-staff-row" id="staff-row" hidden>
+      <button type="button" id="b-inbox" class="pt-inbox-btn"><span>Suggestions inbox</span><span class="pt-badge" id="inbox-badge"></span></button>
+      <button type="button" id="b-insights" class="pt-inbox-btn pt-insights-btn"><span>Insights</span><span>↗</span></button>
+    </div>
+    <input id="list-search" class="pt-search" type="search" placeholder="Search properties and maps" hidden>
+    <ul id="farms" class="pt-farms"></ul>
+    <p id="list-msg" class="pt-msg"></p>
+    <p class="pt-fine" id="signed-in-as"></p>
+  </div>
+</main>
+
+<main id="screen-inbox" class="pt-screen pt-top" hidden>
+  <div class="pt-card pt-xwide">
+    <div class="pt-org"><span class="rv-brand"><img class="rv-logo rv-logo-light" src="brand/logo.png" alt="Rural Consulting"><img class="rv-logo rv-logo-dark" src="brand/logo-dark.png" alt="Rural Consulting"></span><span><button type="button" class="pt-link" id="b-ib-props">All properties</button> · <button type="button" class="pt-link" id="b-ib-insights">Insights</button> · <button type="button" class="pt-link" id="b-ib-signout">Sign out</button></span></div>
+    <h1>Suggestions</h1>
+    <div class="ib-filters">
+      <div class="ib-seg" id="ib-status" role="group" aria-label="Show"></div>
+      <select id="ib-farm" aria-label="Property"></select>
+      <input id="ib-search" type="search" placeholder="Search" aria-label="Search suggestions">
+    </div>
+    <div class="ib-wrap" id="ib-wrap">
+      <ul class="ib-list" id="ib-list"></ul>
+      <section class="ib-detail" id="ib-detail" aria-live="polite"></section>
+    </div>
+    <p id="ib-msg" class="pt-msg"></p>
+  </div>
+</main>
+
+<main id="screen-insights" class="pt-screen pt-top" hidden>
+  <div class="pt-card pt-xwide pt-xxwide in-root">
+    <div class="pt-org"><span class="rv-brand"><img class="rv-logo rv-logo-light" src="brand/logo.png" alt="Rural Consulting"><img class="rv-logo rv-logo-dark" src="brand/logo-dark.png" alt="Rural Consulting"></span><span><button type="button" class="pt-link" id="b-in-props">All properties</button> · <button type="button" class="pt-link" id="b-in-inbox">Suggestions inbox</button> · <button type="button" class="pt-link" id="b-in-signout">Sign out</button></span></div>
+    <div id="insights"><p class="pt-msg" id="in-msg">Loading…</p></div>
+  </div>
+</main>
+
+<div id="screen-map" hidden style="height:100%"></div>
+
+<script src="supabase.js?v=202610182337"></script>
+<script src="config.js?v=202610182337"></script>
+<script src="lib/maplibre-gl-csp.js"></script>
+<script src="lib/pmtiles.js"></script>
+<script src="viewer.js?v=202610182337"></script>
+<script src="insights.js?v=202610182337"></script>
+<script src="portal.js?v=202610182337"></script>
+</body>
+</html>

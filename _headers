@@ -1,0 +1,15 @@
+# Netlify response headers for the portal
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Permissions-Policy: camera=(), microphone=(), geolocation=(self)
+  X-Robots-Tag: noindex, nofollow
+  Strict-Transport-Security: max-age=31536000
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://*.supabase.co https://server.arcgisonline.com https://s3.amazonaws.com https://basemaps.linz.govt.nz; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://server.arcgisonline.com https://s3.amazonaws.com https://basemaps.linz.govt.nz; worker-src 'self' blob:; child-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+
+# the page itself is always checked for a newer version, so uploads show up on a normal refresh
+/
+  Cache-Control: no-cache
+/index.html
+  Cache-Control: no-cache
