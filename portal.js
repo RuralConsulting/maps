@@ -4,7 +4,7 @@
   const cfg = window.RCL_PORTAL || {};
   const $ = (s) => document.querySelector(s);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const LINK_HOURS = 12;
+  const LINK_HOURS = 2;               // signed map links: short, and refreshed quietly before they expire
   const sb = supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey, {
     auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
   });
@@ -42,15 +42,25 @@
   // ---------------------------------------------------------------- change password
   let returnTo = "";
   $("#b-cancel-pw").addEventListener("click", () => { location.hash = returnTo; });
-  ["#pw1", "#pw2"].forEach((s) => $(s).addEventListener("input", () => msg("", "#pw-msg")));
+  ["#pw0", "#pw1", "#pw2"].forEach((s) => $(s).addEventListener("input", () => msg("", "#pw-msg")));
   ["#email", "#password"].forEach((s) => $(s).addEventListener("input", () => msg("")));
   $("#f-password").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const p1 = $("#pw1").value, p2 = $("#pw2").value;
+    const p0 = $("#pw0").value, p1 = $("#pw1").value, p2 = $("#pw2").value;
+    if (!p0) return msg("Enter your current password.", "#pw-msg");
     if (p1.length < 10) return msg("Use at least 10 characters.", "#pw-msg");
     if (p1 !== p2) return msg("The two passwords don't match.", "#pw-msg");
     const b = e.submitter || $("#f-password button[type=submit]");
     b.disabled = true; msg("", "#pw-msg");
+    // check the current password first (on a separate, throw-away client, so this sign-in isn't disturbed):
+    // someone at a computer left signed in can't lock the owner out
+    const { data: { session: cur } } = await sb.auth.getSession();
+    const check = supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey, { auth: { persistSession: false, autoRefreshToken: false } });
+    const { error: wrong } = await check.auth.signInWithPassword({ email: (cur && cur.user.email) || "", password: p0 });
+    if (wrong) {
+      b.disabled = false;
+      return msg(wrong.status === 429 ? "Too many attempts. Wait a few minutes and try again." : "Your current password isn't right.", "#pw-msg");
+    }
     const { error } = await sb.auth.updateUser({ password: p1 });
     b.disabled = false;
     if (error) {
@@ -58,7 +68,8 @@
       if (/weak|short|characters/i.test(error.message)) return msg("That password is too easy to guess. Try a longer one.", "#pw-msg");
       return msg("Couldn't save the new password. Try again in a minute.", "#pw-msg");
     }
-    $("#pw1").value = $("#pw2").value = "";
+    $("#pw0").value = $("#pw1").value = $("#pw2").value = "";
+    sb.auth.signOut({ scope: "others" }).catch(() => {});      // other devices (and the check above) sign in again
     alert("Password changed. Use the new one next time you sign in.");
     location.hash = returnTo;
   });
@@ -67,7 +78,7 @@
     document.title = "Change password | Rural Consulting";
     $("#acct-email").value = session.user.email || "";
     msg("", "#pw-msg");
-    $("#pw1").focus();
+    $("#pw0").focus();
   }
 
   // ---------------------------------------------------------------- RCL staff
@@ -471,7 +482,7 @@
       for (const f of (data.all || []).filter((x) => x.factor_type === "totp" && x.status !== "verified")) {
         await sb.auth.mfa.unenroll({ factorId: f.id });
       }
-      const { data: en, error: e2 } = await sb.auth.mfa.enroll({ factorType: "totp", friendlyName: "RCL authenticator" });
+      const { data: en, error: e2 } = await sb.auth.mfa.enroll({ factorType: "totp", friendlyName: "RCL authenticator", issuer: "Rural Consulting maps" });
       if (e2 || !en) { msg("Couldn't start two-factor setup. Refresh to try again.", "#mfa-msg"); return; }
       mfa = { user: session.user.id, factorId: en.id, enrolling: true };
       $("#mfa-qr").src = en.totp.qr_code;

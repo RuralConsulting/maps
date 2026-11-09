@@ -793,8 +793,10 @@
         const e = document.createElement("span");
         e.className = "rv-label";
         e.textContent = c.f.text;
-        const halo = c.st.halo || (c.st.color && parseInt(c.st.color.slice(1, 3), 16) > 160 ? "#000000" : "#ffffff");
-        e.style.cssText = `font-size:${c.st.size || 12}px;color:${c.st.color || "#1b1b1b"};font-weight:${c.st.bold ? 700 : 600};`
+        const hex = (v) => (/^#[0-9a-f]{3,8}$/i.test(String(v || "")) ? v : null);     // colours from the package: hex only
+        const colour = hex(c.st.color);
+        const halo = hex(c.st.halo) || (colour && parseInt(colour.slice(1, 3), 16) > 160 ? "#000000" : "#ffffff");
+        e.style.cssText = `font-size:${Math.min(Math.max(+c.st.size || 12, 6), 48)}px;color:${colour || "#1b1b1b"};font-weight:${c.st.bold ? 700 : 600};`
           + `text-shadow:0 0 2px ${halo},0 0 2px ${halo},0 0 3px ${halo},0 0 4px ${halo};`;
         e.style.transform = `translate(${c.at[0]}px,${c.at[1]}px) translate(-50%,-50%)`;
         labelBox.appendChild(e);
@@ -891,8 +893,8 @@
         lastGroup = L.group;
       }
       const row = el("div", { class: "rv-layer" + (L.visible ? "" : " off") });
-      const cid = "rv-l-" + L.id;
-      const count = `<span class="rv-count">${L.feature_count || ""}</span>`;
+      const cid = "rv-l-" + String(L.id).replace(/[^a-z0-9_-]/gi, "");
+      const count = `<span class="rv-count">${esc(L.feature_count || "")}</span>`;
       const rivals = L.exclusive ? layers.filter((o) => o !== L && o.exclusive && o.group === L.group).map((o) => o.title) : [];
       if (rivals.length) row.title = "Switching this on switches off " + rivals.join(", ");
       row.innerHTML = `<div class="rv-layer-row"><label for="${cid}"><input id="${cid}" class="rv-switch" type="checkbox" ${L.visible ? "checked" : ""}><span>${esc(L.title)}</span></label>${count}</div>`;
