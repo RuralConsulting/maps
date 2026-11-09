@@ -81,6 +81,10 @@ button, input { font: inherit; color: inherit; }
 .maplibregl-popup-content { background: var(--panel); color: var(--ink); border-radius: 10px; padding: 0; box-shadow: var(--shadow); font-family: var(--f-ui); min-width: 240px; max-width: 320px; }
 .maplibregl-popup-tip { border-top-color: var(--panel) !important; border-bottom-color: var(--panel) !important; }
 .maplibregl-popup-close-button { font-size: 20px; width: 30px; height: 30px; color: var(--ink-2); }
+/* a photo's details while the map looks the way the camera did: a card in the top right, not over the view ahead */
+.rv-floatpop { position: absolute; top: 12px; right: 56px; z-index: 3; max-height: calc(100% - 24px); overflow: auto; border-radius: 10px; }
+.rv-floatpop .maplibregl-popup-content { width: 320px; }
+.rv-floatpop .maplibregl-popup-close-button { position: absolute; right: 0; top: 0; border: 0; background: none; cursor: pointer; }
 .rv-pop { padding: 12px 14px 10px; }
 .rv-pop-kicker { font-size: 12px; color: var(--ink-3); display: flex; align-items: center; gap: 6px; padding-right: 22px; }
 .rv-pop-kicker img { width: 16px; height: 16px; }

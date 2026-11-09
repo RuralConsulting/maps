@@ -262,9 +262,13 @@
         // shade the land outside the property: the whole world with the property cut out of it
         fetch(url(m.boundary)).then((r) => r.json()).then((fc) => {
           map.addSource("mask", { type: "geojson", data: maskOf(fc) });
+          // layers that reach past the boundary (roads, rivers: "around_m") stay bright outside it: the shading then goes
+          // under all the property's own layers (the rest are cut to the boundary, where the shading has its hole anyway)
+          const ownIds = new Set(Object.values(mapIds).flat());
+          const lowest = layers.some((L) => Number(L.around_m) > 0) ? (map.getStyle().layers.find((l) => ownIds.has(l.id)) || {}).id : null;
           map.addLayer({ id: "mask", type: "fill", source: "mask", layout: { visibility: maskOn ? "visible" : "none" },
             paint: { "fill-color": m.mask.color || "#000000", "fill-opacity": Number(m.mask.opacity) || 0.5, "fill-antialias": false } },
-          "boundary-halo");
+          lowest || "boundary-halo");
         }).catch(() => {});
       }
 
@@ -459,13 +463,56 @@
         layer_id: L.id, layer_title: L.title, feature_id: String(feat.id ?? ""), feature_label: feat.properties._label || classLabel(L, feat.properties) || "" };
       if (n > 1) ctx.page = (step) => showFeature(list, (i + step + n) % n, lngLat);
       select(feat);
-      showDetails(html, lngLat, ctx);
+      showDetails(html, lngLat, ctx, photoView(feat, L));
     }
-    function showDetails(html, lngLat, ctx) {
+
+    // ---- a photo with a direction: the map turns to look the way the camera did (as the farm platform does): over the
+    // photo's spot, facing its direction, tilted to the camera's angle (or 55°), close in; the spot sits low in the free
+    // part of the map so the view ahead has room, and the details go in a card in the corner instead of over that view
+    function photoView(feat, L) {
+      const p = feat.properties || {}, d = Number(p._dir);
+      if (!L || !L.draw || L.draw.type !== "direction" || p._dir == null || !Number.isFinite(d) || feat.geometry.type !== "Point") return null;
+      const tilt = p._pitch != null && p._pitch !== "" && Number.isFinite(Number(p._pitch)) ? Number(p._pitch) : 55;
+      return { center: feat.geometry.coordinates, bearing: ((d % 360) + 360) % 360,
+               pitch: Math.max(0, Math.min(tilt, map.getMaxPitch())), zoom: Math.min(Math.max(map.getZoom(), 17), 18.5) };
+    }
+    function lookFrom(view) {
+      const c = map.getContainer().getBoundingClientRect(), W = c.width, H = c.height;
+      let x0 = 0, x1 = W, y0 = 0, y1 = H;
+      if (narrow()) {
+        const sr = sheet.hidden ? null : sheet.getBoundingClientRect();
+        if (sr && sr.top > c.top) y1 = Math.min(H, sr.top - c.top);
+        y0 = 50;
+      } else {
+        const pr = panel.getBoundingClientRect();
+        if (!panel.classList.contains("collapsed")) x0 = Math.max(0, pr.right - c.left);
+        x1 = W - 56;                                          // the zoom and 3D buttons
+        if (x1 - 380 - x0 > 260) x1 -= 380;                   // the photo's card, top right
+      }
+      const x = (x0 + x1) / 2, y = y0 + (y1 - y0) * 0.78;
+      const still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      map.easeTo({ ...view, offset: [x - W / 2, y - H / 2], duration: still ? 0 : 1300, essential: true });
+    }
+    // the details card for a photo view: fixed in the top right corner, styled like a popup, without a pointer
+    function floatCard(html) {
+      const box = el("div", { class: "rv-floatpop" });
+      box.innerHTML = `<div class="maplibregl-popup-content"><button type="button" class="maplibregl-popup-close-button" aria-label="Close popup">×</button>${html}</div>`;
+      mapEl.appendChild(box);
+      const card = { remove: () => box.remove(), getElement: () => box };
+      box.querySelector(".maplibregl-popup-close-button").addEventListener("click", () => { if (popup === card) popup = null; card.remove(); select(null); });
+      return card;
+    }
+    function showDetails(html, lngLat, ctx, view) {
       if (popup) { popup.remove(); popup = null; }
       if (narrow()) {
         const body = openSheet(html);
         wire(body, ctx);
+        if (view) requestAnimationFrame(() => lookFrom(view));
+      } else if (view) {
+        closeSheet();
+        popup = floatCard(html);
+        wire(popup.getElement(), ctx);
+        lookFrom(view);
       } else {
         closeSheet();
         popup = new maplibregl.Popup({ maxWidth: "340px", offset: 12 }).setLngLat(lngLat).setHTML(html).addTo(map);
@@ -655,18 +702,25 @@
           return out;
         };
         const areaLayer = L.geometry ? /poly/i.test(L.geometry) : null;
+        const lines = {};                                   // text -> [coords]: joined up below
         (fc.features || []).forEach((f) => { try {
           const t = f.properties && f.properties._lbl;
           if (!t || !f.geometry) return;
           let parts = flat(f.geometry, []).filter((pt) => ["Polygon", "Line", "Point"].includes(pt.type));
           if (areaLayer || parts.some((pt) => pt.type === "Polygon")) parts = parts.filter((pt) => pt.type === "Polygon");
-          const thin = (r) => { if (r.length <= 160) return r; const k = Math.ceil(r.length / 150); return r.filter((_, i) => i % k === 0 || i === r.length - 1); };
           parts.forEach((pt) => {
-            const it = { text: t, type: pt.type, bbox: bboxOf(pt.c), coords: pt.type === "Line" ? thin(pt.c) : pt.c };
+            if (pt.type === "Line") { (lines[t] = lines[t] || []).push(pt.c); return; }
+            const it = { text: t, type: pt.type, bbox: bboxOf(pt.c), coords: pt.c };
             if (pt.type === "Polygon") { it.raw = pt.c; it.coords = outlineAt(it, 15); }   // 3D uses a ~3 m outline
             labelData[L.id].push(it);
           });
         } catch (e) { /* one odd shape never stops the rest being labelled */ } });
+        // a road or river comes in many short sections (Topo50 cuts them at every junction): sections with the same name
+        // that meet are joined into one line, so the name has room to be written along it
+        Object.entries(lines).forEach(([t, parts]) => joinLines(parts).forEach((c) => {
+          const thinned = c.length <= 420 ? c : c.filter((_, i) => i % Math.ceil(c.length / 400) === 0 || i === c.length - 1);
+          labelData[L.id].push({ text: t, type: "Line", bbox: bboxOf(c), coords: thinned });
+        }));
         placeLabels();
       }).catch(() => {});
     });
@@ -686,6 +740,89 @@
       });
       f.oz = key; return f.oc;
     }
+    // join line pieces that share an end into longer lines (greedy; where three meet, as braids do, any one continues)
+    function joinLines(parts) {
+      const key = (p) => p[0].toFixed(6) + "," + p[1].toFixed(6), ends = {};
+      parts.forEach((c, i) => { if (c.length < 2) return; [key(c[0]), key(c[c.length - 1])].forEach((k) => (ends[k] = ends[k] || []).push(i)); });
+      const used = new Array(parts.length).fill(false), out = [];
+      const next = (k) => (ends[k] || []).find((j) => !used[j]);
+      parts.forEach((c, i) => {
+        if (used[i] || c.length < 2) return;
+        used[i] = true;
+        let line = c.slice();
+        for (let j = next(key(line[line.length - 1])); j !== undefined; j = next(key(line[line.length - 1]))) {
+          used[j] = true; const d = parts[j];
+          line = line.concat((key(d[0]) === key(line[line.length - 1]) ? d : d.slice().reverse()).slice(1));
+        }
+        for (let j = next(key(line[0])); j !== undefined; j = next(key(line[0]))) {
+          used[j] = true; const d = parts[j];
+          line = (key(d[d.length - 1]) === key(line[0]) ? d : d.slice().reverse()).slice(0, -1).concat(line);
+        }
+        out.push(line);
+      });
+      return out;
+    }
+    // the parts of a screen polyline inside the box [x0, y0, x1, y1], each a list of points (segments are cut at the edge)
+    function runsOf(pts, x0, y0, x1, y1) {
+      const runs = []; let cur = null;
+      for (let i = 1; i < pts.length; i++) {
+        const [ax, ay] = pts[i - 1], [bx, by] = pts[i], dx = bx - ax, dy = by - ay;
+        let t0 = 0, t1 = 1, ok = true;
+        [[-dx, ax - x0], [dx, x1 - ax], [-dy, ay - y0], [dy, y1 - ay]].forEach(([p, q]) => {
+          if (!ok) return;
+          if (p === 0) { if (q < 0) ok = false; return; }
+          const r = q / p;
+          if (p < 0) { if (r > t1) ok = false; else if (r > t0) t0 = r; } else { if (r < t0) ok = false; else if (r < t1) t1 = r; }
+        });
+        if (!ok) { cur = null; continue; }
+        const a = [ax + t0 * dx, ay + t0 * dy], b = [ax + t1 * dx, ay + t1 * dy];
+        if (cur && t0 === 0) cur.push(b); else { cur = [a, b]; runs.push(cur); }
+        if (t1 < 1) cur = null;
+      }
+      return runs;
+    }
+    // a straight-enough stretch of a run, the label's width long, centred near distance s along it: where the label
+    // goes and its angle (degrees, kept upright), or null where the line bends too much there
+    function alongLine(run, cum, s, tw, th) {
+      const len = cum[cum.length - 1];
+      const at = (d) => { let i = 1; while (i < cum.length - 1 && cum[i] < d) i++;
+        const seg = cum[i] - cum[i - 1] || 1, k = (d - cum[i - 1]) / seg;
+        return [run[i - 1][0] + k * (run[i][0] - run[i - 1][0]), run[i - 1][1] + k * (run[i][1] - run[i - 1][1])]; };
+      for (const shift of [0, 0.3, -0.3, 0.6, -0.6, 0.9, -0.9]) {
+        const c = s + shift * tw, d0 = c - tw / 2, d1 = c + tw / 2;
+        if (d0 < 0 || d1 > len) continue;
+        const a = at(d0), b = at(d1), dx = b[0] - a[0], dy = b[1] - a[1], chord = Math.hypot(dx, dy) || 1;
+        let bend = 0;
+        for (let i = 1; i < run.length - 1; i++) {
+          if (cum[i] <= d0 || cum[i] >= d1) continue;
+          bend = Math.max(bend, Math.abs((run[i][0] - a[0]) * dy - (run[i][1] - a[1]) * dx) / chord);
+        }
+        if (bend > th * 0.5 || chord < tw * 0.85) continue;
+        let ang = (Math.atan2(dy, dx) * 180) / Math.PI;
+        if (ang > 90) ang -= 180; else if (ang <= -90) ang += 180;
+        return { at: at(c), ang };
+      }
+      return null;
+    }
+    // label boxes, turned or not: { cx, cy, hw, hh, ang (degrees) }; overlap by separating axes
+    function corners(o) {
+      const r = (o.ang * Math.PI) / 180, c = Math.cos(r), s = Math.sin(r);
+      return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([u, v]) => [o.cx + u * o.hw * c - v * o.hh * s, o.cy + u * o.hw * s + v * o.hh * c]);
+    }
+    function overlaps(a, b) {
+      if (Math.hypot(a.cx - b.cx, a.cy - b.cy) > Math.hypot(a.hw, a.hh) + Math.hypot(b.hw, b.hh)) return false;
+      const ca = corners(a), cb = corners(b);
+      for (const o of [a, b]) {
+        const r = (o.ang * Math.PI) / 180;
+        for (const [ux, uy] of [[Math.cos(r), Math.sin(r)], [-Math.sin(r), Math.cos(r)]]) {
+          const pa = ca.map(([x, y]) => x * ux + y * uy), pb = cb.map(([x, y]) => x * ux + y * uy);
+          if (Math.max(...pa) < Math.min(...pb) || Math.max(...pb) < Math.min(...pa)) return false;
+        }
+      }
+      return true;
+    }
+    const LINE_REPEAT = 450;                                // a long road or river is named again about every 450 px
+    const SAME_GAP = 300;                                   // ... but never within 300 px of the same name (braided rivers)
     const REPEAT = 340;                                     // big areas show their label again about every 340 px
     function placeLabels() {
       const t0 = performance.now();
@@ -755,9 +892,22 @@
               });
             }
           } else if (f.type === "Line") {
-            const pts = f.coords.map((p) => { const q = map.project(p); return [q.x, q.y]; }).filter((p) => p[0] > x0 && p[0] < x1 && p[1] > y0 && p[1] < y1);
-            if (!pts.length) return;
-            at = pts[Math.floor(pts.length / 2)]; weight = pts.length;
+            // along the line, turned to follow it: each visible stretch named at its middle, long ones again every ~450 px
+            const scr = f.coords.map((p) => { const q = map.project(p); return [q.x, q.y]; });
+            runsOf(scr, x0, y0, x1, y1).forEach((run) => {
+              const cum = [0];
+              for (let i = 1; i < run.length; i++) cum.push(cum[i - 1] + Math.hypot(run[i][0] - run[i - 1][0], run[i][1] - run[i - 1][1]));
+              const len = cum[cum.length - 1];
+              if (len < tw + 4) return;
+              const spots = [len / 2];
+              for (let d = len / 2 + LINE_REPEAT; d < len - tw / 2; d += LINE_REPEAT) spots.push(d);
+              for (let d = len / 2 - LINE_REPEAT; d > tw / 2; d -= LINE_REPEAT) spots.push(d);
+              spots.forEach((d, k) => {
+                const fit = alongLine(run, cum, d, tw, th);
+                if (fit) cands.push({ L, f, at: fit.at, ang: fit.ang, alts: null, tw, th, weight: len, st, order, again: k > 0, line: true });
+              });
+            });
+            return;
           } else {
             const q = map.project(f.coords);
             if (q.x < x0 || q.x > x1 || q.y < y0 || q.y > y1) return;
@@ -770,8 +920,9 @@
       });
       // every area's own label before any repeats; layers higher in the list win; then bigger areas (longer lines) first
       cands.sort((a, b) => (a.again ? 1 : 0) - (b.again ? 1 : 0) || a.order - b.order || b.weight - a.weight);
-      const free = (box) => !(box[0] < x0 || box[2] > x1 || box[1] < y0 || box[3] > y1)
-        && !placed.some((p) => !(box[2] < p.box[0] || box[0] > p.box[2] || box[3] < p.box[1] || box[1] > p.box[3]));
+      const free = (o) => corners(o).every(([x, y]) => x >= x0 && x <= x1 && y >= y0 && y <= y1)
+        && !placed.some((p) => overlaps(o, p.box));
+      const sameName = {};                                  // layer + name -> where it is already written (lines)
       // in 3D a hill can hide part of the map: only label what can actually be seen at that spot
       const terrain = !!map.getTerrain();
       const inRing = (pt, ring) => { let inside = false; for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) { const a = ring[i], b = ring[j];
@@ -784,12 +935,15 @@
         return Math.hypot((ll.lng - target[0]) * Math.cos((ll.lat * Math.PI) / 180), ll.lat - target[1]) * 111320 < 30;
       };
       cands.forEach((c) => {
+        const nameKey = c.L.id + "\u0000" + c.f.text;
+        if (c.line && (sameName[nameKey] || []).some((q) => Math.hypot(q[0] - c.at[0], q[1] - c.at[1]) < SAME_GAP)) return;
         let box = null;
         for (const at of c.alts || [c.at]) {
-          const b2 = [at[0] - c.tw / 2, at[1] - c.th / 2, at[0] + c.tw / 2, at[1] + c.th / 2];
+          const b2 = { cx: at[0], cy: at[1], hw: c.tw / 2, hh: c.th / 2, ang: c.ang || 0 };
           if (free(b2) && seen(c, at)) { box = b2; c.at = at; break; }
         }
         if (!box) return;
+        if (c.line) (sameName[nameKey] = sameName[nameKey] || []).push(c.at);
         const e = document.createElement("span");
         e.className = "rv-label";
         e.textContent = c.f.text;
@@ -797,14 +951,20 @@
         const colour = hex(c.st.color);
         const halo = hex(c.st.halo) || (colour && parseInt(colour.slice(1, 3), 16) > 160 ? "#000000" : "#ffffff");
         e.style.cssText = `font-size:${Math.min(Math.max(+c.st.size || 12, 6), 48)}px;color:${colour || "#1b1b1b"};font-weight:${c.st.bold ? 700 : 600};`
-          + `text-shadow:0 0 2px ${halo},0 0 2px ${halo},0 0 3px ${halo},0 0 4px ${halo};`;
-        e.style.transform = `translate(${c.at[0]}px,${c.at[1]}px) translate(-50%,-50%)`;
+          + `${c.st.italic ? "font-style:italic;" : ""}text-shadow:0 0 2px ${halo},0 0 2px ${halo},0 0 3px ${halo},0 0 4px ${halo};`;
+        e.style.transform = `translate(${c.at[0]}px,${c.at[1]}px) translate(-50%,-50%)` + (c.ang ? ` rotate(${c.ang.toFixed(1)}deg)` : "");
         labelBox.appendChild(e);
-        placed.push({ box, e, lnglat: map.unproject(c.at) });
+        placed.push({ box, e, lnglat: map.unproject(c.at), ang: c.ang || 0, bearing: map.getBearing() });
       });
     }
     // while the map moves, labels move with it; once it stops they're placed again for what's on screen
-    map.on("move", () => placed.forEach((p) => { const q = map.project(p.lnglat); p.e.style.transform = `translate(${q.x}px,${q.y}px) translate(-50%,-50%)`; }));
+    map.on("move", () => {
+      const brg = map.getBearing();
+      placed.forEach((p) => {
+        const q = map.project(p.lnglat), a = p.ang ? p.ang - (brg - p.bearing) : 0;
+        p.e.style.transform = `translate(${q.x}px,${q.y}px) translate(-50%,-50%)` + (a ? ` rotate(${a.toFixed(1)}deg)` : "");
+      });
+    });
     map.on("moveend", placeLabels);
     window.addEventListener("resize", () => setTimeout(placeLabels, 50));
 
