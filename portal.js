@@ -9,9 +9,9 @@
     auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
   });
 
-  const ACCOUNT = "~password", INBOX = "~inbox", INSIGHTS = "~insights";
+  const ACCOUNT = "~password", INBOX = "~inbox", INSIGHTS = "~insights", STAFF = "~staff", QGIS = "~qgis";
   function show(id) {
-    ["screen-signin", "screen-account", "screen-list", "screen-map", "screen-inbox", "screen-insights"].forEach((s) => { document.getElementById(s).hidden = s !== id; });
+    ["screen-signin", "screen-account", "screen-list", "screen-map", "screen-inbox", "screen-insights", "screen-mfa", "screen-staff", "screen-qgis"].forEach((s) => { document.getElementById(s).hidden = s !== id; });
   }
   function msg(t, where = "#msg") { $(where).textContent = t || ""; }
 
@@ -32,10 +32,10 @@
       return msg("We couldn't sign you in just now. Try again in a minute.");
     }
     $("#password").value = "";
-    staff = null; cache = null;
+    resetStaff(); cache = null;
     route();
   });
-  async function signOut() { await sb.auth.signOut(); staff = null; cache = null; location.hash = ""; route(); }
+  async function signOut() { await sb.auth.signOut(); resetStaff(); cache = null; location.hash = ""; route(); }
   $("#b-signout").addEventListener("click", signOut);
   $("#b-password").addEventListener("click", () => { location.hash = ACCOUNT; });
 
@@ -71,24 +71,33 @@
   }
 
   // ---------------------------------------------------------------- RCL staff
+  // role: "admin", "publisher" or "staff" once signed in with two-factor; null for customers (and staff before their code)
   let staff = null;
-  async function isStaff() {
+  function resetStaff() { staff = null; mfa = null; myRole = null; }
+  async function staffRole() {
     if (staff === null) {
-      const { data, error } = await sb.rpc("is_staff");
-      staff = !error && data === true;
+      const { data, error } = await sb.rpc("staff_role");
+      staff = !error && typeof data === "string" ? data : "";
     }
-    return staff;
+    return staff || null;
   }
+  async function isStaff() { return !!(await staffRole()); }
+  const isPublisher = async () => ["admin", "publisher"].includes(await staffRole());
   async function inboxButton() {
     const b = $("#staff-row");
-    if (!(await isStaff())) { b.hidden = true; return; }
+    const role = await staffRole();
+    if (!role) { b.hidden = true; return; }
     b.hidden = false;
+    $("#b-staff").hidden = role !== "admin";
+    $("#b-qgis").hidden = !["admin", "publisher"].includes(role);
     const { data } = await sb.from("suggestions").select("id,status");
     const n = (data || []).filter((x) => x.status === "new").length;
     $("#inbox-badge").textContent = n ? n + " new" : "";
   }
   $("#b-inbox").addEventListener("click", () => { location.hash = INBOX; });
   $("#b-insights").addEventListener("click", () => { location.hash = INSIGHTS; });
+  $("#b-staff").addEventListener("click", () => { location.hash = STAFF; });
+  $("#b-qgis").addEventListener("click", () => { location.hash = QGIS; });
   $("#b-ib-insights").addEventListener("click", () => { location.hash = INSIGHTS; });
   $("#b-in-props").addEventListener("click", () => { location.hash = ""; });
   $("#b-in-inbox").addEventListener("click", () => { location.hash = INBOX; });
@@ -427,14 +436,190 @@
       || "<li>Nothing yet.</li>";
   }
 
+  // ---------------------------------------------------------------- two-factor sign-in for RCL staff
+  // Staff accounts need a code from an authenticator app as well as the password. Until they've entered it, the
+  // database treats them like a customer, so here they go straight to the code (or setup) screen.
+  let mfa = null;                       // { user, factorId, enrolling } while the code screen is up
+  let myRole = null;                    // { user, role }: is this account staff at all (asked once per sign-in)
+  async function staffGate(session) {
+    if (!myRole || myRole.user !== session.user.id) {
+      const { data, error } = await sb.rpc("my_staff_role");
+      if (error) return false;          // older database without roles: carry on as before
+      myRole = { user: session.user.id, role: data || null };
+    }
+    if (!myRole.role) return false;
+    const { data: lvl } = await sb.auth.mfa.getAuthenticatorAssuranceLevel();
+    if (lvl && lvl.currentLevel === "aal2") return false;
+    await showMfa(session);
+    return true;
+  }
+  async function showMfa(session) {
+    show("screen-mfa");
+    document.title = "Sign in | Rural Consulting";
+    if (mfa && mfa.user === session.user.id) { $("#mfa-input").focus(); return; }
+    msg("", "#mfa-msg");
+    $("#mfa-input").value = "";
+    $("#mfa-enrol").hidden = $("#mfa-code").hidden = true;
+    const { data, error } = await sb.auth.mfa.listFactors();
+    if (error) { msg("Couldn't start two-factor sign-in. Refresh to try again.", "#mfa-msg"); return; }
+    const verified = (data.totp || []).filter((f) => f.status === "verified");
+    if (verified.length) {
+      mfa = { user: session.user.id, factorId: verified[0].id, enrolling: false };
+      $("#mfa-code").hidden = false;
+    } else {
+      // a setup left half-done (e.g. the page was closed) blocks a new one: clear it first
+      for (const f of (data.all || []).filter((x) => x.factor_type === "totp" && x.status !== "verified")) {
+        await sb.auth.mfa.unenroll({ factorId: f.id });
+      }
+      const { data: en, error: e2 } = await sb.auth.mfa.enroll({ factorType: "totp", friendlyName: "RCL authenticator" });
+      if (e2 || !en) { msg("Couldn't start two-factor setup. Refresh to try again.", "#mfa-msg"); return; }
+      mfa = { user: session.user.id, factorId: en.id, enrolling: true };
+      $("#mfa-qr").src = en.totp.qr_code;
+      $("#mfa-secret").textContent = en.totp.secret;
+      $("#mfa-enrol").hidden = false;
+    }
+    $("#mfa-lost").hidden = mfa.enrolling;
+    $("#mfa-input").focus();
+  }
+  $("#mfa-input").addEventListener("input", () => msg("", "#mfa-msg"));
+  $("#f-mfa").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const code = $("#mfa-input").value.replace(/\s/g, "");
+    if (!/^\d{6}$/.test(code)) return msg("Type the 6 digits your app shows.", "#mfa-msg");
+    if (!mfa) return;
+    const b = e.submitter || $("#f-mfa button");
+    b.disabled = true; msg("", "#mfa-msg");
+    const { error } = await sb.auth.mfa.challengeAndVerify({ factorId: mfa.factorId, code });
+    b.disabled = false;
+    if (error) {
+      if (error.status === 429) return msg("Too many attempts. Wait a few minutes and try again.", "#mfa-msg");
+      return msg("That code didn't work. Codes change every 30 seconds: type the one showing now.", "#mfa-msg");
+    }
+    $("#mfa-input").value = "";
+    resetStaff(); cache = null;
+    route();
+  });
+  $("#b-mfa-signout").addEventListener("click", signOut);
+
+  // ---------------------------------------------------------------- staff page (admins): who is staff and what they can do
+  async function staffFn(body) {
+    const { data, error } = await sb.functions.invoke("staff-admin", { body });
+    if (error) {
+      let m = "Couldn't reach the server. Try again in a minute.";
+      try { const j = await error.context.json(); if (j && j.error) m = j.error; } catch (e2) { /* keep the general message */ }
+      throw new Error(m);
+    }
+    return data;
+  }
+  const ROLE_LABEL = { admin: "Admin", publisher: "Publisher", staff: "Staff" };
+  const AUDIT = { staff_added: "Added to staff", staff_role: "Role changed", staff_removed: "Removed from staff",
+    two_factor_reset: "Two-factor reset", password_reset: "Password reset", customer_created: "Customer account made" };
+  function showSecret(text, password) {
+    const box = $("#st-shown");
+    box.hidden = false;
+    box.innerHTML = `${esc(text)}<br><code>${esc(password)}</code> <button type="button" class="pt-link" id="b-st-copy">Copy</button>
+      <div class="pt-fine">Shown once only. Send it to them yourself (e.g. a text or Teams message); they can change it after signing in.</div>`;
+    $("#b-st-copy").addEventListener("click", () => {
+      navigator.clipboard.writeText(password).then(() => { $("#b-st-copy").textContent = "Copied"; }, () => {});
+    });
+  }
+  async function showStaff() {
+    show("screen-staff");
+    document.title = "Staff | Rural Consulting";
+    msg("", "#st-msg");
+    let d;
+    try { d = await staffFn({ action: "staff_list" }); } catch (e) { $("#st-rows").innerHTML = ""; msg(e.message, "#st-msg"); return; }
+    $("#st-rows").innerHTML = d.staff.map((p, i) => `<tr>
+        <td>${esc(p.email)}${p.me ? '<span class="st-you">you</span>' : ""}</td>
+        <td><select data-i="${i}" aria-label="Role for ${esc(p.email)}">${Object.entries(ROLE_LABEL).map(([k, l]) =>
+          `<option value="${k}" ${k === p.role ? "selected" : ""}>${l}</option>`).join("")}</select></td>
+        <td>${p.two_factor ? "Set up" : '<span class="st-no">Not yet</span>'}</td>
+        <td>${p.last_sign_in_at ? esc(when(p.last_sign_in_at)) : "Never"}</td>
+        <td class="st-acts">${p.me ? '<span class="pt-fine">Use Change password</span>' : `<button type="button" class="pt-link" data-a="pw" data-i="${i}">Reset password</button>${p.two_factor
+          ? `<button type="button" class="pt-link" data-a="2fa" data-i="${i}">Reset two-factor</button>` : ""}<button type="button" class="pt-link" data-a="rm" data-i="${i}">Remove</button>`}</td></tr>`).join("")
+      || '<tr><td colspan="5">No staff yet.</td></tr>';
+    $("#st-rows").querySelectorAll("select").forEach((sel) => sel.addEventListener("change", async () => {
+      const p = d.staff[+sel.dataset.i];
+      if (p.me && sel.value !== "admin" && !confirm("Change your own role? You'll lose access to this page.")) { sel.value = p.role; return; }
+      sel.disabled = true;
+      try { await staffFn({ action: "staff_set_role", email: p.email, role: sel.value }); }
+      catch (e) { sel.value = p.role; msg(e.message, "#st-msg"); sel.disabled = false; return; }
+      if (p.me) { resetStaff(); location.hash = ""; return; }
+      showStaff();
+    }));
+    $("#st-rows").querySelectorAll("button[data-a]").forEach((b) => b.addEventListener("click", async () => {
+      const p = d.staff[+b.dataset.i];
+      msg("", "#st-msg");
+      try {
+        if (b.dataset.a === "pw") {
+          if (!confirm(`Give ${p.email} a new password? Their current one stops working and they're signed out everywhere (including QGIS) straight away.`)) return;
+          const r = await staffFn({ action: "reset_password", email: p.email });
+          showSecret(`New password for ${p.email}:`, r.password);
+        } else if (b.dataset.a === "2fa") {
+          if (!confirm(`Reset two-factor for ${p.email}? They're signed out everywhere and get a new password; with it they set up a new authenticator at their next sign-in.`)) return;
+          const r = await staffFn({ action: "staff_reset_2fa", email: p.email });
+          showSecret(`Two-factor reset. New password for ${p.email} (give it only to them):`, r.password);
+        } else {
+          if (!confirm(`Remove ${p.email} from staff? They'll keep any customer access they have, but lose staff powers and are signed out everywhere straight away.`)) return;
+          await staffFn({ action: "staff_remove", email: p.email });
+        }
+      } catch (e) { msg(e.message, "#st-msg"); return; }
+      if (b.dataset.a === "rm") $("#st-shown").hidden = true;
+      showStaff();
+    }));
+    $("#st-audit").innerHTML = (d.audit || []).slice(0, 30).map((a) => `<li><small>${esc(when(a.at))}</small>${esc(AUDIT[a.action] || a.action)}:
+      ${esc(a.target || "")}${a.detail ? " (" + esc(a.detail) + ")" : ""} <small>by ${esc(a.by_email || "")}</small></li>`).join("")
+      || "<li>Nothing yet.</li>";
+  }
+  $("#f-staff-add").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email = $("#st-email").value.trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return msg("Enter a valid email address.", "#st-msg");
+    const b = e.submitter || $("#f-staff-add button");
+    b.disabled = true; msg("", "#st-msg"); $("#st-shown").hidden = true;
+    try {
+      const r = await staffFn({ action: "staff_add", email, role: $("#st-role").value });
+      $("#st-email").value = "";
+      if (r.password) showSecret(`New account for ${email}. Their password:`, r.password);
+    } catch (err) { msg(err.message, "#st-msg"); }
+    b.disabled = false;
+    showStaff();
+  });
+  $("#b-st-props").addEventListener("click", () => { location.hash = ""; });
+  $("#b-st-qgis").addEventListener("click", () => { location.hash = QGIS; });
+  $("#b-st-signout").addEventListener("click", signOut);
+
+  // ---------------------------------------------------------------- QGIS plugin: how to install it (publishers and admins)
+  function showQgis() {
+    show("screen-qgis");
+    document.title = "QGIS plugin | Rural Consulting";
+    const base = location.origin + location.pathname.replace(/[^/]*$/, "");
+    $("#qg-repo").textContent = base + "qgis/plugins.xml";
+  }
+  $("#b-qg-copy").addEventListener("click", () => {
+    navigator.clipboard.writeText($("#qg-repo").textContent).then(() => { $("#b-qg-copy").textContent = "Copied"; }, () => {});
+  });
+  $("#b-qg-props").addEventListener("click", () => { location.hash = ""; });
+  $("#b-qg-signout").addEventListener("click", signOut);
+
   // ---------------------------------------------------------------- routing: #property or #property/map
   async function route() {
     const { data: { session } } = await sb.auth.getSession();
     if (!session) { show("screen-signin"); document.title = "Farm maps | Rural Consulting"; return; }
+    if (await staffGate(session)) return;              // staff: code from the authenticator app first
+    mfa = null;
     if (location.hash === "#" + ACCOUNT) return showAccount(session);
     returnTo = location.hash.replace(/^#/, "");
     if (location.hash === "#" + INSIGHTS) {
       if (await isStaff()) return showInsights();
+      location.hash = ""; return;
+    }
+    if (location.hash === "#" + STAFF) {
+      if ((await staffRole()) === "admin") return showStaff();
+      location.hash = ""; return;
+    }
+    if (location.hash === "#" + QGIS) {
+      if (await isPublisher()) return showQgis();
       location.hash = ""; return;
     }
     if (location.hash.startsWith("#" + INBOX)) {
