@@ -3,6 +3,7 @@
  *   manifest, url: relPath => absoluteUrl, onBack?, actions?: [{ label, onClick }],
  *   suggest?: { list: async () => [suggestion], submit: async (draft) => void,      // portal only
  *              focus?: suggestionId, manage?: (suggestion) => void }                // staff: open in the inbox
+ *   shared?: [layer entry or null, one for each of manifest.shared_layers]          // platform: layers published once, see mergeShared
  * })
  * Works for the local preview (url = identity) and the customer portal (url = signed link).
  */
@@ -68,6 +69,19 @@
     g.lineWidth = 2.5; g.strokeStyle = "#fff"; g.stroke();
     return c.toDataURL("image/png");
   }
+  function lineIcon(color, w) {
+    const c = document.createElement("canvas"); c.width = c.height = 40;
+    const g = c.getContext("2d");
+    g.beginPath(); g.moveTo(4, 26); g.bezierCurveTo(14, 12, 24, 34, 36, 18);
+    g.lineCap = "round"; g.lineWidth = w; g.strokeStyle = color; g.stroke();
+    return c.toDataURL("image/png");
+  }
+  // shared regional waterways (vector tiles, one file for the whole region, not part of any package)
+  const REF_CLASSES = [["River", "#4f9bd9", 5], ["Canal or race", "#3fb8c9", 4], ["Stream or creek", "#6aaee6", 3.2],
+    ["Small waterway", "#8cc3ee", 2.4], ["Drain", "#9bb7c9", 2]];
+  const REF_FILE = "ref/waterways-canterbury.pmtiles";
+  const REF_LIVE = "https://maps.ruralconsulting.co.nz/" + REF_FILE;
+  const REF_CREDIT = "Waterways: LINZ Topo50 (CC BY 4.0)";
   function colorExpr(colors) {
     if (!colors || !colors.length) return "#e8590c";
     if (colors.length === 1) return colors[0];
@@ -150,6 +164,32 @@
     return { type: "FeatureCollection", features: feats };
   }
 
+  // Layers published once and shared by many maps (core layers, a group's shared layers). manifest.shared_layers names them, with
+  // where each goes in the list; whoever mounts the viewer says where each one is (opts.shared, by its place in that list, each a
+  // layer entry like those in manifest.layers, its files found through url()). The viewer makes no database calls of its own.
+  // One that nobody can supply is left out and reported, so the map still opens. These layers are region-wide and not cut to the
+  // boundary, which is why they count as reaching past it for the mask below.
+  function mergeShared(own, refs, supplied, missing) {
+    const inserts = [];
+    (refs || []).forEach((ref, i) => {
+      const L = supplied && supplied[i];
+      if (!L || !L.tiles) { missing.push(ref.title || ref.key); return; }
+      inserts.push({ at: Number.isFinite(ref.position) ? ref.position : own.length, L: Object.assign({ opacity: 1, legend: [] }, L, {
+        id: L.id || "shared-" + i, title: ref.title || L.title, group: ref.group ?? L.group ?? "", visible: ref.visible !== false,
+        exclusive: !!ref.exclusive, shared: true }) });
+    });
+    if (!inserts.length) return own.slice();
+    inserts.sort((a, b) => a.at - b.at);
+    const out = [];
+    let k = 0;
+    for (let i = 0; i <= own.length; i++) {
+      while (k < inserts.length && inserts[k].at <= i) out.push(inserts[k++].L);
+      if (i < own.length) out.push(own[i]);
+    }
+    while (k < inserts.length) out.push(inserts[k++].L);
+    return out;
+  }
+
   function mount(root, opts) {
     const m = opts.manifest;
     const url = opts.url || ((p) => p);
@@ -230,10 +270,17 @@
     map.addControl({ onAdd: () => ctl3d, onRemove: () => ctl3d.remove() }, "top-right");
     btn3d.addEventListener("click", () => setThreeD(!threeD));
 
-    const layers = m.layers.map((L) => Object.assign({}, L));   // top first, as in QGIS
+    const sharedMissing = [];                      // shared layers the map refers to that could not be supplied
+    const layers = mergeShared(m.layers.map((L) => Object.assign({}, L)), m.shared_layers, opts.shared, sharedMissing);   // top first, as in QGIS
     // "one at a time" groups (mutually exclusive in QGIS): only the top one that starts on stays on
     const exOn = {};
     layers.forEach((L) => { if (L.exclusive && L.visible) { if (exOn[L.group]) L.visible = false; else exOn[L.group] = true; } });
+    // reference waterways: drawn under the property's layers and over the outside shading; off with "reference": false
+    const REF_ID = "ref-waterways";
+    const refWanted = m.reference !== false && opts.reference !== false;
+    const REF_L = { id: REF_ID, title: "Waterways", ref: true, visible: storeGet("rv-ref-ww") !== "0",
+      labels: { size: 12, color: "#ffffff", italic: true, minzoom: 11 } };
+    let refReady = false;
     const hitIds = [];
     const coneIds = [];                            // photo cones are clickable too: a cone picks the photo facing that way
     const mapIds = {};                             // web layer id -> map layer ids (for the on/off switch)
@@ -242,6 +289,37 @@
     let maskOn = true;
 
     // add the property's layers as soon as the map's style is ready, without waiting for the background imagery
+    function addReference() {
+      const urls = [opts.referenceUrl, new URL(REF_FILE, document.baseURI).href, REF_LIVE].filter(Boolean);
+      const probe = (i) => {
+        if (i >= urls.length) return;                         // not available here: the row stays hidden
+        fetch(urls[i], { headers: { Range: "bytes=0-6" } }).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject()))
+          .then((b) => {
+            if (new TextDecoder().decode(new Uint8Array(b).slice(0, 7)) !== "PMTiles") return probe(i + 1);
+            const own0 = new Set(Object.values(mapIds).flat());
+            const before = (map.getStyle().layers.find((l) => own0.has(l.id)) || {}).id || (map.getLayer("boundary-halo") ? "boundary-halo" : undefined);
+            map.addSource("ref-ww", { type: "vector", url: "pmtiles://" + urls[i], attribution: REF_CREDIT });
+            const colour = ["match", ["get", "wclass"], ...REF_CLASSES.slice(0, 2).flatMap(([k, c]) => [k, c]),
+              REF_CLASSES[2][0], REF_CLASSES[2][1], REF_CLASSES[4][0], REF_CLASSES[4][1], REF_CLASSES[3][1]];
+            const w = (k) => ["match", ["get", "wclass"], "River", k * 1.6, "Canal or race", k * 1.2, "Stream or creek", k, k * 0.7];
+            const vis = REF_L.visible ? "visible" : "none";
+            map.addLayer({ id: own(REF_L, "ref-ww-small"), type: "line", source: "ref-ww", "source-layer": "small", minzoom: 12,
+              layout: { visibility: vis, "line-cap": "round", "line-join": "round" },
+              paint: { "line-color": colour, "line-opacity": 0.85,
+                "line-width": ["interpolate", ["exponential", 1.5], ["zoom"], 12, 0.5, 15, 1.2, 18, 2.6] } }, before);
+            map.addLayer({ id: own(REF_L, "ref-ww-main"), type: "line", source: "ref-ww", "source-layer": "main",
+              layout: { visibility: vis, "line-cap": "round", "line-join": "round" },
+              paint: { "line-color": colour, "line-opacity": 0.95,
+                "line-width": ["interpolate", ["exponential", 1.5], ["zoom"], 7, w(0.5), 11, w(1.1), 14, w(1.8), 17, w(3.2), 20, w(5)] } }, before);
+            if (map.getLayer("mask")) map.moveLayer("mask", "ref-ww-small");     // shading under the waterways
+            refReady = true;
+            const row = root.querySelector(".rv-ref-row"), head = root.querySelector(".rv-ref-group");
+            if (row) row.hidden = false;
+            if (head) head.hidden = false;
+          }).catch(() => probe(i + 1));
+      };
+      probe(0);
+    }
     let started = false;
     const setup = () => {
       if (started) return;
@@ -250,15 +328,12 @@
       layers.slice().reverse().forEach((L) => {
         if (L.vector && L.features) return addVector(L);
         if (!L.tiles) return;
-        const from = L.visible_from || L.minzoom || 0;
         // big imagery comes in pieces (each under 1 GB), each covering part of the area and zooms: draw them all
-        const parts = L.tile_parts && L.tile_parts.length > 1 ? L.tile_parts : [{ tiles: L.tiles }];
-        parts.forEach((P, i) => {
-          const id = "t-" + L.id + (i ? "-" + (i + 1) : "");
-          const src = { type: "raster", url: "pmtiles://" + url(P.tiles), tileSize: 256, minzoom: Math.max(from, P.minzoom || 0) };
+        rasterParts(L).forEach((P) => {
+          const src = { type: "raster", url: "pmtiles://" + url(P.tiles), tileSize: 256, minzoom: P.minzoom };
           if (P.bounds) src.bounds = P.bounds;
-          map.addSource(id, src);
-          map.addLayer({ id: own(L, id), type: "raster", source: id, minzoom: Math.max(0, Math.max(from, P.minzoom || 0) - 0.5),
+          map.addSource(P.id, src);
+          map.addLayer({ id: own(L, P.id), type: "raster", source: P.id, minzoom: Math.max(0, P.minzoom - 0.5),
             paint: { "raster-opacity": L.opacity ?? 1, "raster-fade-duration": 0, "raster-resampling": "linear" },
             layout: { visibility: L.visible ? "visible" : "none" } });
         });
@@ -266,14 +341,17 @@
       map.addSource("boundary", { type: "geojson", data: url(m.boundary) });
       map.addLayer({ id: "boundary-halo", type: "line", source: "boundary", paint: { "line-color": "#0b1612", "line-width": 5, "line-opacity": 0.45 } });
       map.addLayer({ id: "boundary", type: "line", source: "boundary", paint: { "line-color": "#ffffff", "line-width": 2, "line-dasharray": [3, 2] } });
+      if (refWanted) addReference();
       if (m.mask) {
         // shade the land outside the property: the whole world with the property cut out of it
         fetch(url(m.boundary)).then((r) => r.json()).then((fc) => {
           map.addSource("mask", { type: "geojson", data: maskOf(fc) });
           // layers that reach past the boundary (roads, rivers: "around_m") stay bright outside it: the shading then goes
           // under all the property's own layers (the rest are cut to the boundary, where the shading has its hole anyway)
+          // the property's own layers are cut to the boundary (where the shading has its hole), so the shading can sit
+          // under all of them: then reference waterways and layers reaching past the boundary stay bright outside it
           const ownIds = new Set(Object.values(mapIds).flat());
-          const lowest = layers.some((L) => Number(L.around_m) > 0) ? (map.getStyle().layers.find((l) => ownIds.has(l.id)) || {}).id : null;
+          const lowest = (map.getStyle().layers.find((l) => ownIds.has(l.id)) || {}).id || null;
           map.addLayer({ id: "mask", type: "fill", source: "mask", layout: { visibility: maskOn ? "visible" : "none" },
             paint: { "fill-color": m.mask.color || "#000000", "fill-opacity": Number(m.mask.opacity) || 0.5, "fill-antialias": false } },
           lowest || "boundary-halo");
@@ -688,12 +766,14 @@
 
     // ---------------------------------------------------------------- labels
     const labelLayers = layers.filter((L) => L.labels && L.features);
+    if (refWanted) labelLayers.push(REF_L);                // last: the property's own labels win
     let labelsOn = true;
     const labelBox = el("div", { class: "rv-labels", "aria-hidden": "true" });
     mapEl.insertBefore(labelBox, mapEl.querySelector(".maplibregl-control-container"));   // under controls and popups
     const labelData = {};                                   // layer id -> [{text, type, coords, bbox}]
     const layerOn = (L) => { const c = root.querySelector("#rv-l-" + L.id); return c ? c.checked : L.visible; };
     let placed = [];
+    let printing = false;                                   // laying the map out for print: no panel or sheet to avoid
     function bboxOf(coords) {
       let a = Infinity, b = Infinity, c = -Infinity, d = -Infinity;
       const walk = (x) => { if (typeof x[0] === "number") { a = Math.min(a, x[0]); b = Math.min(b, x[1]); c = Math.max(c, x[0]); d = Math.max(d, x[1]); } else x.forEach(walk); };
@@ -838,13 +918,42 @@
       const t0 = performance.now();
       try { placeLabelsNow(); } finally { RCLViewer.stats.labelsMs = Math.round(performance.now() - t0); }
     }
+    // names along the reference waterways, from the tiles already loaded for this view (rivers, streams, canals)
+    function refLabels() {
+      labelData[REF_ID] = [];
+      if (!refReady || !layerOn(REF_L) || map.getZoom() < 10.75) return;
+      const by = {}, seenPart = new Set();
+      map.querySourceFeatures("ref-ww", { sourceLayer: "main" }).forEach((f) => {
+        const t = f.properties && f.properties.name, g = f.geometry;
+        if (!t || !g) return;
+        (g.type === "LineString" ? [g.coordinates] : g.type === "MultiLineString" ? g.coordinates : []).forEach((c) => {
+          if (c.length < 2) return;
+          const k = t + c[0].join() + c[c.length - 1].join();
+          if (seenPart.has(k)) return;                        // the same piece from a neighbouring tile
+          seenPart.add(k); (by[t] = by[t] || []).push(c);
+        });
+      });
+      const out = [];
+      Object.entries(by).forEach(([t, parts]) => joinLines(parts).forEach((c) => {
+        const bb = bboxOf(c);
+        out.push({ text: t, type: "Line", bbox: bb, coords: c.length <= 300 ? c : c.filter((_, i) => i % Math.ceil(c.length / 280) === 0 || i === c.length - 1),
+          size: (bb[2] - bb[0]) + (bb[3] - bb[1]) });
+      }));
+      labelData[REF_ID] = out.sort((a, b) => b.size - a.size).slice(0, 250);   // the longest first, enough for one screen
+    }
+    let refTimer = null;
+    map.on("sourcedata", (e) => {
+      if (e.sourceId !== "ref-ww" || !e.tile) return;
+      clearTimeout(refTimer); refTimer = setTimeout(placeLabels, 350);
+    });
     function placeLabelsNow() {
+      refLabels();
       labelBox.innerHTML = ""; placed = [];
       if (!labelsOn || !labelLayers.length) return;
       const z = map.getZoom(), b = map.getBounds(), W = mapEl.clientWidth, H = mapEl.clientHeight;
       const pr = panel.getBoundingClientRect(), mr = mapEl.getBoundingClientRect();
-      const left = !narrow() && !panel.classList.contains("collapsed") ? Math.max(0, pr.right - mr.left) : 0;
-      const peek = narrow() ? parseFloat(getComputedStyle(root).getPropertyValue("--peek")) || 0 : 0;   // phone: under the sheet
+      const left = !printing && !narrow() && !panel.classList.contains("collapsed") ? Math.max(0, pr.right - mr.left) : 0;
+      const peek = !printing && narrow() ? parseFloat(getComputedStyle(root).getPropertyValue("--peek")) || 0 : 0;   // phone: under the sheet
       const x0 = left + 4, y0 = 4, x1 = W - 4, y1 = H - peek - 4;
       const cands = [], terrain3d = !!map.getTerrain();
       labelLayers.forEach((L, order) => {
@@ -964,7 +1073,9 @@
           + `${c.st.italic ? "font-style:italic;" : ""}text-shadow:0 0 2px ${halo},0 0 2px ${halo},0 0 3px ${halo},0 0 4px ${halo};`;
         e.style.transform = `translate(${c.at[0]}px,${c.at[1]}px) translate(-50%,-50%)` + (c.ang ? ` rotate(${c.ang.toFixed(1)}deg)` : "");
         labelBox.appendChild(e);
-        placed.push({ box, e, lnglat: map.unproject(c.at), ang: c.ang || 0, bearing: map.getBearing() });
+        placed.push({ box, e, lnglat: map.unproject(c.at), ang: c.ang || 0, bearing: map.getBearing(),
+          text: c.f.text, at: c.at.slice(), colour: colour || "#1b1b1b", halo, size: Math.min(Math.max(+c.st.size || 12, 6), 48),
+          bold: !!c.st.bold, italic: !!c.st.italic });
       });
     }
     // while the map moves, labels move with it; once it stops they're placed again for what's on screen
@@ -997,6 +1108,7 @@
         ${opts.maps && opts.maps.length > 1 ? `<div class="rv-mapsel"><label for="rv-mapsel">Other maps of this property</label>
           <select id="rv-mapsel">${opts.maps.map((x) => `<option value="${esc(x.id)}" ${x.id === opts.currentMap ? "selected" : ""}>${esc(x.title)}${x.kind ? " (" + esc(x.kind) + ")" : ""}</option>`).join("")}</select></div>` : ""}
         ${desc ? `<div class="rv-desc${desc.length > 180 ? " clamp" : ""}"><p>${esc(desc).replace(/\n/g, "<br>")}</p>${desc.length > 180 ? '<button type="button" class="rv-link rv-more">More</button>' : ""}</div>` : ""}
+        ${sharedMissing.length ? `<p class="rv-shared-note" role="status">Not shown on this map: ${esc(sharedMissing.join(", "))} (not available just now).</p>` : ""}
       </div>
       <div class="rv-foot">
         <div class="rv-seg" role="group" aria-label="Background map">
@@ -1101,9 +1213,25 @@
         clearSelection();
       });
       const op = row.querySelector(".rv-opacity input");
-      if (op) op.addEventListener("input", (e) => (mapIds[L.id] || []).filter((id) => id.startsWith("t-")).forEach((id) => map.setPaintProperty(id, "raster-opacity", e.target.value / 100)));
+      if (op) op.addEventListener("input", (e) => rasterParts(L).forEach((P) => map.getLayer(P.id) && map.setPaintProperty(P.id, "raster-opacity", e.target.value / 100)));
     });
 
+    if (refWanted) {
+      body.appendChild(el("div", { class: "rv-group rv-ref-group", hidden: "" }, "Reference"));
+      const row = el("div", { class: "rv-layer rv-ref-row" + (REF_L.visible ? "" : " off"), hidden: "" });
+      row.innerHTML = `<div class="rv-layer-row"><label for="rv-l-${REF_ID}"><input id="rv-l-${REF_ID}" class="rv-switch" type="checkbox" ${REF_L.visible ? "checked" : ""}><span>Waterways</span></label><span class="rv-count"></span></div>
+        <ul class="rv-legend">${REF_CLASSES.map(([k, c, w]) => `<li><img alt="" src="${lineIcon(c, w)}"><span>${esc(k)}</span></li>`).join("")}</ul>
+        <div class="rv-ref-note">${esc(REF_CREDIT)}</div>`;
+      row.dataset.from = 0; row.dataset.count = "";
+      body.appendChild(row);
+      row.querySelector("input").addEventListener("change", (e) => {
+        const on = e.target.checked;
+        REF_L.visible = on; storeSet("rv-ref-ww", on ? "1" : "0");
+        row.classList.toggle("off", !on);
+        (mapIds[REF_ID] || []).forEach((id) => map.getLayer(id) && map.setLayoutProperty(id, "visibility", on ? "visible" : "none"));
+        placeLabels();
+      });
+    }
     if (maskRow) body.appendChild(maskRow);                // after the layers
     if (labelLayers.length) {
       const row = el("div", { class: "rv-layer rv-mask-row" });
@@ -1380,48 +1508,149 @@
       }
       return (L.legend || []).map((g) => ({ label: g.label, src: url(g.icon) }));
     }
+    // one A4 landscape page, always: the map drawn again at print resolution for the space it has on the page, labels
+    // painted into the picture, a legend of what's on (and in view) that shrinks to fit, scale, north arrow, credits
+    const PAGE = { mapW: 204, mapH: 150, ratio: 2.5 };             // map size on the page (mm), pixels per CSS pixel
+    function scaleFor(mppPaper) {                                     // ground metres per mm of paper
+      const maxM = mppPaper * 42, p = 10 ** Math.floor(Math.log10(maxM));
+      const n = [5, 2, 1].map((k) => k * p).find((v) => v <= maxM) || p;
+      const fmt = (v) => (n >= 1000 ? `${+(v / 1000).toFixed(2)}` : `${+v.toFixed(1)}`);
+      const sig = (v) => { const e = 10 ** (Math.floor(Math.log10(v)) - 1); return Math.round(v / e) * e; };
+      return { mm: n / mppPaper, n, unit: n >= 1000 ? "km" : "m", half: fmt(n / 2), full: fmt(n), ratio: sig(mppPaper * 1000) };
+    }
+    function legendFor(L, present) {
+      let items;
+      if (L.draw) {
+        const colors = L.draw.colors && L.draw.colors.length ? L.draw.colors : ["#e8590c"];
+        const lg = L.legend || [];
+        items = lg.length > 1 ? lg.map((g, i) => ({ i, label: g.label, src: legendIcon(colors[i] || colors[0], L.draw.type === "direction") }))
+          : [{ i: 0, label: "", src: legendIcon(colors[0], L.draw.type === "direction") }];
+      } else items = (L.legend || []).map((g, i) => ({ i, label: g.label, src: url(g.icon) }));
+      if (present && items.length > 1) items = items.filter((g) => present.has(g.i));
+      return items;
+    }
+    function printLegend() {
+      const blocks = [];
+      layers.forEach((L) => {
+        if (!isOn(L)) return;
+        let present = null;
+        if (L.features && map.getLayer("hit-" + L.id)) {
+          const got = map.queryRenderedFeatures({ layers: ["hit-" + L.id] });
+          if (!got.length) return;                                  // nothing of it in this view
+          present = new Set(got.map((f) => (f.properties._cls == null ? 0 : Number(f.properties._cls))));
+        }
+        const items = legendFor(L, present);
+        if (items.length === 1 && !items[0].label) blocks.push({ title: L.title, icon: items[0].src, items: [] });
+        else blocks.push({ title: L.title, items: items.filter((g) => g.label) });
+      });
+      if (refReady && layerOn(REF_L)) {
+        const ids = (mapIds[REF_ID] || []).filter((id) => map.getLayer(id));
+        const have = new Set(map.queryRenderedFeatures({ layers: ids }).map((f) => f.properties.wclass));
+        const items = REF_CLASSES.filter(([k]) => have.has(k)).map(([k, c, w]) => ({ label: k, src: lineIcon(c, w) }));
+        if (items.length) blocks.push({ title: "Waterways", items });
+      }
+      return blocks;
+    }
+    function paintLabels(g, k, list) {                               // the labels placed for print, into the picture
+      const fam = getComputedStyle(labelBox.querySelector(".rv-label") || labelBox).fontFamily || "sans-serif";
+      g.textAlign = "center"; g.textBaseline = "middle"; g.lineJoin = "round";
+      list.forEach((p) => {
+        g.save();
+        g.translate(p.at[0] * k, p.at[1] * k);
+        if (p.ang) g.rotate((p.ang * Math.PI) / 180);
+        g.font = `${p.italic ? "italic " : ""}${p.bold ? 700 : 600} ${p.size * k}px ${fam}`;
+        g.strokeStyle = p.halo; g.lineWidth = 3.2 * k; g.globalAlpha = 0.9; g.strokeText(p.text, 0, 0);
+        g.globalAlpha = 1; g.fillStyle = p.colour; g.fillText(p.text, 0, 0);
+        g.restore();
+      });
+    }
+    function capture() {                                             // -> Promise of {img, zoom, lat, bearing, pitch}
+      return new Promise((resolve, reject) => {
+        const pxmm = 96 / 25.4, cw = Math.round(PAGE.mapW * pxmm), ch = Math.round(PAGE.mapH * pxmm);
+        const W = mapEl.clientWidth, H = mapEl.clientHeight;
+        const pr = panel.getBoundingClientRect(), mr = mapEl.getBoundingClientRect();
+        const left = !narrow() && !panel.classList.contains("collapsed") ? Math.max(0, pr.right - mr.left) : 0;
+        const peek = narrow() ? parseFloat(getComputedStyle(root).getPropertyValue("--peek")) || 0 : 0;
+        const fw = Math.max(200, W - left), fh = Math.max(200, H - peek);
+        const was = { center: map.getCenter(), zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(), padding: map.getPadding() };
+        const centre = map.unproject([left + fw / 2, fh / 2]);
+        const zoom = was.zoom + Math.log2(Math.min(cw / fw, ch / fh));   // the same view, sized for the page
+        const restore = () => {
+          printing = false;
+          mapEl.style.cssText = "";
+          try { map.setPixelRatio(window.devicePixelRatio || 1); } catch (e) { /* older map library */ }
+          map.resize(); map.jumpTo(was); placeLabels();
+        };
+        printing = true;
+        mapEl.style.cssText = `inset:auto;left:0;top:0;width:${cw}px;height:${ch}px;`;
+        try { map.setPixelRatio(PAGE.ratio); } catch (e) { /* older map library: screen resolution */ }
+        map.resize();
+        map.jumpTo({ center: centre, zoom, bearing: was.bearing, pitch: was.pitch, padding: { top: 0, bottom: 0, left: 0, right: 0 } });
+        let done = false;
+        const grab = () => {
+          if (done) return; done = true;
+          placeLabelsNow();
+          const legend = printLegend();
+          map.once("render", () => {
+            let src;
+            try { src = map.getCanvas().toDataURL("image/png"); } catch (e) { src = null; }
+            const info = { zoom: map.getZoom(), lat: map.getCenter().lat, bearing: map.getBearing(), pitch: map.getPitch(), legend };
+            const k = map.getCanvas().width / cw;
+            const snap = placed.slice();                         // restoring the screen places its own labels again
+            const labelsDraw = (g) => paintLabels(g, k, snap);
+            restore();
+            if (!src) return reject(new Error("canvas"));
+            const im = new Image();
+            im.onload = () => {
+              const c = document.createElement("canvas"); c.width = im.width; c.height = im.height;
+              const g = c.getContext("2d"); g.drawImage(im, 0, 0); labelsDraw(g);
+              resolve(Object.assign(info, { img: c.toDataURL("image/jpeg", 0.92) }));
+            };
+            im.onerror = () => reject(new Error("image"));
+            im.src = src;
+          });
+          map.triggerRepaint();
+        };
+        map.once("idle", grab);
+        setTimeout(grab, 20000);                                     // slow imagery: print what has arrived
+      });
+    }
     function printView() {
-      const canvas = map.getCanvas();
-      map.once("render", () => {
-        let img;
-        try { img = canvas.toDataURL("image/png"); } catch (e) { img = null; }   // read during the frame: no extra GPU memory
-        if (!img) { alert("Sorry, this map view can't be printed in this browser."); return; }
-        const w = mapEl.clientWidth, h = mapEl.clientHeight;
-        const zoom = map.getZoom(), lat = map.getCenter().lat;
-        const mpp = (40075016.686 * Math.cos(rad(lat))) / (512 * 2 ** zoom);
-        const room = layers.some((L) => isOn(L)) ? 800 : 1010;     // landscape page, legend beside the map
-        const pz = Math.min(1, room / w, 560 / h);                   // the map image is shrunk by this to fit
-        const sc = map.getPitch() < 5 ? niceScale(mpp / pz, 180) : null;   // measured on the printed image
-        const shown = layers.filter((L) => isOn(L));
-        const legend = shown.map((L) => {
-          const items = legendFor(L);
-          const head = items.length === 1 && !items[0].label
-            ? `<li class="rv-pl-layer"><img alt="" src="${esc(items[0].src)}"><span>${esc(L.title)}</span></li>`
-            : `<li class="rv-pl-layer"><span>${esc(L.title)}</span></li>`
-              + items.filter((g) => g.label).map((g) => `<li><img alt="" src="${esc(g.src)}"><span>${esc(g.label)}</span></li>`).join("");
-          return head;
-        }).join("");
+      if (document.querySelector(".rv-print")) return;
+      const busy = el("div", { class: "rv-print-busy" }, "Preparing the print…");
+      root.appendChild(busy);
+      capture().then((v) => {
+        busy.remove();
+        const pxmm = 96 / 25.4, cw = Math.round(PAGE.mapW * pxmm);
+        const mpp = (40075016.686 * Math.cos(rad(v.lat))) / (512 * 2 ** v.zoom);      // ground metres per CSS pixel
+        const sc = v.pitch < 5 ? scaleFor(mpp * cw / PAGE.mapW) : null;
         const property = m.property && m.property !== (m.map_title || m.title) ? m.property : "";
         const meta = [property, m.survey_date ? "Surveyed " + fmtDate(m.survey_date) : ""].filter(Boolean).join(" · ");
         const bmOn = ["aerial", "map"].find((k) => map.getLayoutProperty("bm-" + k, "visibility") !== "none");
-        const credit = [bmOn ? String(BASEMAPS[bmOn].attribution || "").replace(/<[^>]*>/g, "") : "", "Rural Consulting Limited"].filter(Boolean).join(" · ");
-        const labels = labelBox.cloneNode(true);
-        labels.classList.add("rv-pl-labels");
-        const sheet = el("div", { class: "rv-print" });
+        const credits = [bmOn ? String(BASEMAPS[bmOn].attribution || "").replace(/<[^>]*>/g, "") : "",
+          refReady && layerOn(REF_L) ? REF_CREDIT : "", threeD ? "Elevation: LINZ" : ""].filter(Boolean).join(" · ");
+        const segs = sc ? [0, 1, 2, 3].map((i) => `<rect x="${(i * sc.mm) / 4}" y="0" width="${sc.mm / 4}" height="1.6" fill="${i % 2 ? "#fff" : "#1b2a24"}" stroke="#1b2a24" stroke-width=".25"/>`).join("") : "";
+        const scale = sc ? `<div class="rv-pl-scale"><svg width="${sc.mm + 2}mm" height="2.2mm" viewBox="-1 -0.3 ${sc.mm + 2} 2.2">${segs}</svg>
+            <div class="rv-pl-ticks" style="width:${sc.mm}mm"><span>0</span><span>${sc.half}</span><span>${sc.full} ${sc.unit}</span></div>
+            <div class="rv-pl-ratio">Scale 1:${sc.ratio.toLocaleString("en-NZ")} at A4</div></div>`
+          : `<div class="rv-pl-scale"><div class="rv-pl-ratio">Perspective view, not to scale</div></div>`;
+        const north = `<div class="rv-pl-north"><svg viewBox="-10 -12 20 24" style="transform:rotate(${-v.bearing}deg)"><path d="M0-11 6 8 0 4-6 8z" fill="#1b2a24"/><path d="M0-11 0 4-6 8z" fill="#fff" stroke="#1b2a24" stroke-width=".8"/></svg><b>N</b></div>`;
+        const blocks = v.legend.map((b) => `<section class="rv-pl-blk"><h4>${b.icon ? `<img alt="" src="${esc(b.icon)}">` : ""}${esc(b.title)}</h4>`
+          + (b.items.length ? `<ul>${b.items.map((g) => `<li><img alt="" src="${esc(g.src)}"><span>${esc(g.label)}</span></li>`).join("")}</ul>` : "") + "</section>").join("");
+        const sheet = el("div", { class: "rv-print rv-print-measure" });
         sheet.innerHTML = `<header class="rv-pl-head"><img class="rv-pl-logo" src="brand/logo.png" alt="Rural Consulting">
-            <div><div class="rv-pl-title">${esc(m.map_title || m.title)}</div><div class="rv-pl-meta">${esc(meta)}</div></div></header>
+            <div class="rv-pl-ht"><div class="rv-pl-title">${esc(m.map_title || m.title)}</div><div class="rv-pl-meta">${esc(meta)}</div></div></header>
           <div class="rv-pl-body">
-            <div class="rv-pl-mapcol"><figure class="rv-pl-fig" style="width:${w}px;height:${h}px"><img class="rv-pl-map" alt="Map" src="${img}"></figure>
-              <div class="rv-pl-cap">
-                ${sc ? `<div class="rv-pl-scale"><div style="width:${sc.px.toFixed(1)}px"></div><span>${esc(sc.label)}</span></div>` : `<div class="rv-pl-scale"><span>Tilted view, not to scale</span></div>`}
-                <div class="rv-pl-north" aria-label="North"><span style="transform:rotate(${-map.getBearing()}deg)">▲</span>N</div>
-              </div></div>
-            ${legend ? `<aside class="rv-pl-legend"><div class="rv-pl-lh">Legend</div><ul>${legend}</ul></aside>` : ""}
+            <figure class="rv-pl-fig" style="width:${PAGE.mapW}mm;height:${PAGE.mapH}mm"><img class="rv-pl-map" alt="Map" src="${v.img}">
+              <div class="rv-pl-plate rv-pl-plate-l">${scale}</div><div class="rv-pl-plate rv-pl-plate-r">${north}</div></figure>
+            <aside class="rv-pl-legend"><div class="rv-pl-lh">Legend</div><div class="rv-pl-lcols">${blocks || '<p class="rv-pl-none">No layers switched on.</p>'}</div></aside>
           </div>
-          <footer class="rv-pl-foot"><span>${esc(credit)}</span><span>Printed ${esc(new Date().toLocaleDateString("en-NZ", { day: "numeric", month: "long", year: "numeric" }))}</span></footer>`;
-        sheet.querySelector(".rv-pl-fig").appendChild(labels);
-        sheet.style.setProperty("--pz", String(pz));
+          <footer class="rv-pl-foot"><div class="rv-pl-f1"><span>Rural Consulting Limited · ruralconsulting.co.nz</span><span>${esc(credits)}</span>
+              <span>Printed ${esc(new Date().toLocaleDateString("en-NZ", { day: "numeric", month: "long", year: "numeric" }))}</span></div>
+            <div class="rv-pl-f2">Indicative only: boundaries and features are approximate and are not a legal survey. Check on the ground before relying on them.</div></footer>`;
         document.body.appendChild(sheet);
+        fitLegend(sheet.querySelector(".rv-pl-lcols"));
+        sheet.classList.remove("rv-print-measure");
         document.body.classList.add("rv-printing");
         let cleaned = false;
         const clean = () => { if (cleaned) return; cleaned = true; sheet.remove(); document.body.classList.remove("rv-printing"); window.removeEventListener("afterprint", clean); };
@@ -1431,13 +1660,44 @@
           window.print();
           setTimeout(clean, 1000);                   // browsers that don't send afterprint
         });
-      });
-      map.triggerRepaint();
+      }).catch(() => { busy.remove(); alert("Sorry, this map view can't be printed in this browser."); });
+    }
+    // shrink the legend until it fits its box: smaller type, then two columns, then "+ N more"
+    function fitLegend(box) {
+      const over = () => box.scrollHeight > box.clientHeight + 1 || box.scrollWidth > box.clientWidth + 1;
+      for (const cols of [1, 2]) {
+        box.style.columnCount = cols;
+        for (const pt of [8.5, 8, 7.5, 7, 6.5]) { box.style.fontSize = pt + "pt"; if (!over()) return; }
+      }
+      const items = [...box.querySelectorAll("li, .rv-pl-blk")].reverse();
+      let hidden = 0;
+      const more = el("p", { class: "rv-pl-more" });
+      box.appendChild(more);
+      for (const it of items) {
+        if (!over()) break;
+        if (it.classList.contains("rv-pl-blk") && it.querySelector("li")) continue;
+        hidden += it.tagName === "LI" || !it.querySelector("ul") ? 1 : 0;      // an emptied heading isn't counted again
+        it.remove();
+        more.textContent = `+ ${hidden} more`;
+      }
+      if (!hidden) more.remove();
     }
     btnPrint.addEventListener("click", () => { endTool(); printView(); });
     return map;
   }
 
-  const RCLViewer = { mount, terrain: null, stats: {} };
+  // A layer's map-image files: one, or the pieces big imagery is saved in (manifest "tile_parts", from plugin 0.10.1).
+  // Each piece: its own source and layer id ("t-<id>", "t-<id>-2"...), its zooms and the area it covers.
+  function rasterParts(L) {
+    const from = L.visible_from || L.minzoom || 0;
+    const parts = Array.isArray(L.tile_parts) && L.tile_parts.length > 1 ? L.tile_parts : [{ tiles: L.tiles }];
+    return parts.filter((P) => P && P.tiles).map((P, i) => ({
+      id: "t-" + L.id + (i ? "-" + (i + 1) : ""), tiles: P.tiles,
+      minzoom: Math.max(from, Number(P.minzoom) || 0),
+      bounds: Array.isArray(P.bounds) && P.bounds.length === 4 ? P.bounds : null,
+    }));
+  }
+
+  const RCLViewer = { mount, mergeShared, rasterParts, terrain: null, stats: {} };
   window.RCLViewer = RCLViewer;
 })();
