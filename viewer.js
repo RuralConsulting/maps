@@ -250,10 +250,17 @@
         if (L.vector && L.features) return addVector(L);
         if (!L.tiles) return;
         const from = L.visible_from || L.minzoom || 0;
-        map.addSource("t-" + L.id, { type: "raster", url: "pmtiles://" + url(L.tiles), tileSize: 256, minzoom: from });
-        map.addLayer({ id: own(L, "t-" + L.id), type: "raster", source: "t-" + L.id, minzoom: Math.max(0, from - 0.5),
-          paint: { "raster-opacity": L.opacity ?? 1, "raster-fade-duration": 0, "raster-resampling": "linear" },
-          layout: { visibility: L.visible ? "visible" : "none" } });
+        // big imagery comes in pieces (each under 1 GB), each covering part of the area and zooms: draw them all
+        const parts = L.tile_parts && L.tile_parts.length > 1 ? L.tile_parts : [{ tiles: L.tiles }];
+        parts.forEach((P, i) => {
+          const id = "t-" + L.id + (i ? "-" + (i + 1) : "");
+          const src = { type: "raster", url: "pmtiles://" + url(P.tiles), tileSize: 256, minzoom: Math.max(from, P.minzoom || 0) };
+          if (P.bounds) src.bounds = P.bounds;
+          map.addSource(id, src);
+          map.addLayer({ id: own(L, id), type: "raster", source: id, minzoom: Math.max(0, Math.max(from, P.minzoom || 0) - 0.5),
+            paint: { "raster-opacity": L.opacity ?? 1, "raster-fade-duration": 0, "raster-resampling": "linear" },
+            layout: { visibility: L.visible ? "visible" : "none" } });
+        });
       });
       map.addSource("boundary", { type: "geojson", data: url(m.boundary) });
       map.addLayer({ id: "boundary-halo", type: "line", source: "boundary", paint: { "line-color": "#0b1612", "line-width": 5, "line-opacity": 0.45 } });
@@ -1091,7 +1098,7 @@
         clearSelection();
       });
       const op = row.querySelector(".rv-opacity input");
-      if (op) op.addEventListener("input", (e) => map.setPaintProperty("t-" + L.id, "raster-opacity", e.target.value / 100));
+      if (op) op.addEventListener("input", (e) => (mapIds[L.id] || []).filter((id) => id.startsWith("t-")).forEach((id) => map.setPaintProperty(id, "raster-opacity", e.target.value / 100)));
     });
 
     if (maskRow) body.appendChild(maskRow);                // after the layers
