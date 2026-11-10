@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <plugins>
-  <pyqgis_plugin name="RCL Web Package" version="0.11.0" plugin_id="rcl_web_package">
+  <pyqgis_plugin name="RCL Web Package" version="0.11.1" plugin_id="rcl_web_package">
     <description>Package a property's map (imagery and styled layers, clipped to its titles) for the RCL customer portal.</description>
     <about>Select a property's titles, tick the layers to include, and build a web package: layers are drawn exactly as styled in QGIS and clipped to the property, with clickable features, photos and a legend. Preview it locally, then publish it to the portal and give customers access by email.</about>
-    <version>0.11.0</version>
+    <version>0.11.1</version>
     <qgis_minimum_version>3.28</qgis_minimum_version>
     <author_name>Rural Consulting Limited</author_name>
     <file_name>rcl_web_package.zip</file_name>
@@ -13,6 +13,6 @@
     <deprecated>False</deprecated>
     <trusted>True</trusted>
     <icon></icon>
-    <update_date>2026-11-10T02:23:53</update_date>
+    <update_date>2026-11-10T02:48:08</update_date>
   </pyqgis_plugin>
 </plugins>
