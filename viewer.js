@@ -69,19 +69,45 @@
     g.lineWidth = 2.5; g.strokeStyle = "#fff"; g.stroke();
     return c.toDataURL("image/png");
   }
-  function lineIcon(color, w) {
+  function lineIcon(color, w, o = {}) {
     const c = document.createElement("canvas"); c.width = c.height = 40;
     const g = c.getContext("2d");
-    g.beginPath(); g.moveTo(4, 26); g.bezierCurveTo(14, 12, 24, 34, 36, 18);
-    g.lineCap = "round"; g.lineWidth = w; g.strokeStyle = color; g.stroke();
+    const path = () => { g.beginPath(); g.moveTo(4, 26); g.bezierCurveTo(14, 12, 24, 34, 36, 18); };
+    g.lineCap = "round";
+    if (o.casing) { path(); g.lineWidth = w + 2; g.strokeStyle = o.casing; g.stroke(); }   // pale lines show on white paper
+    path(); g.lineWidth = w; g.strokeStyle = color;
+    if (o.dash) { g.lineCap = "butt"; g.setLineDash(o.dash); }
+    g.stroke();
     return c.toDataURL("image/png");
   }
-  // shared regional waterways (vector tiles, one file for the whole region, not part of any package)
-  const REF_CLASSES = [["River", "#4f9bd9", 5], ["Canal or race", "#3fb8c9", 4], ["Stream or creek", "#6aaee6", 3.2],
-    ["Small waterway", "#8cc3ee", 2.4], ["Drain", "#9bb7c9", 2]];
-  const REF_FILE = "ref/waterways-canterbury.pmtiles";
-  const REF_LIVE = "https://maps.ruralconsulting.co.nz/" + REF_FILE;
-  const REF_CREDIT = "Waterways: LINZ Topo50 (CC BY 4.0)";
+  // shared reference layers (vector tiles, one public file each for every map, not part of any package), bottom first.
+  // classes: [key, legend label, colour, legend width, {dash, casing}]
+  const REF_DEFS = [
+    { key: "waterways", id: "ref-waterways", src: "ref-ww", title: "Waterways", store: "rv-ref-ww",
+      file: "ref/waterways-canterbury.pmtiles", credit: "Waterways: LINZ Topo50 (CC BY 4.0)", prop: "wclass",
+      classes: [["River", "River", "#4f9bd9", 5], ["Canal or race", "Canal or race", "#3fb8c9", 4],
+        ["Stream or creek", "Stream or creek", "#6aaee6", 3.2], ["Small waterway", "Small waterway", "#8cc3ee", 2.4],
+        ["Drain", "Drain", "#9bb7c9", 2]],
+      labels: { size: 12, color: "#ffffff", italic: true, minzoom: 11 }, labelFrom: 10.75, labelLayers: ["main"],
+      labelText: (p) => p.name || null },
+    { key: "roads", id: "ref-roads", src: "ref-rd", title: "Roads", store: "rv-ref-rd",
+      file: "ref/roads-nz.pmtiles", credit: "Roads: LINZ Topo50 (CC BY 4.0)", prop: "rclass",
+      classes: [["highway", "State highway", "#f5d76e", 5, { casing: "#3a3a3a" }],
+        ["sealed", "Sealed road", "#f2f2f2", 3.6, { casing: "#3a3a3a" }],
+        ["metalled", "Metalled road", "#e8a35c", 3],
+        ["unmetalled", "Unmetalled road", "#e8a35c", 3, { dash: [5, 4] }]],
+      labels: { size: 11, color: "#ffffff", minzoom: 9.75 }, labelFrom: 9.75, labelLayers: ["major", "minor"],
+      // state highways as "SH 1" from zoom 10; road names from zoom 13
+      labelText: (p, z) => (p.ref ? "SH " + p.ref : z >= 12.75 ? roadName(p.name) : null) },
+  ];
+  // LINZ road names are in capitals: "WAKANUI ROAD" -> "Wakanui Road", "MCLEAN STREET" -> "McLean Street"
+  function roadName(t) {
+    if (!t) return null;
+    if (t !== t.toUpperCase()) return t;
+    return t.toLowerCase().replace(/(^|[\s\-/('])([a-zāēīōū])/g, (_, a, b) => a + b.toUpperCase())
+      .replace(/\bMc([a-z])/g, (_, b) => "Mc" + b.toUpperCase()).replace(/\b(Sh|Nz)\b/g, (x) => x.toUpperCase());
+  }
+  const REF_LIVE_BASE = "https://maps.ruralconsulting.co.nz/";
   function colorExpr(colors) {
     if (!colors || !colors.length) return "#e8590c";
     if (colors.length === 1) return colors[0];
@@ -275,12 +301,13 @@
     // "one at a time" groups (mutually exclusive in QGIS): only the top one that starts on stays on
     const exOn = {};
     layers.forEach((L) => { if (L.exclusive && L.visible) { if (exOn[L.group]) L.visible = false; else exOn[L.group] = true; } });
-    // reference waterways: drawn under the property's layers and over the outside shading; off with "reference": false
-    const REF_ID = "ref-waterways";
-    const refWanted = m.reference !== false && opts.reference !== false;
-    const REF_L = { id: REF_ID, title: "Waterways", ref: true, visible: storeGet("rv-ref-ww") !== "0",
-      labels: { size: 12, color: "#ffffff", italic: true, minzoom: 11 } };
-    let refReady = false;
+    // reference layers (waterways, roads): drawn under the property's layers and over the outside shading.
+    // Off for a map with "reference": false, or one at a time with "reference": {"roads": false}
+    const refOff = (r, key) => r === false || (r && typeof r === "object" && r[key] === false);
+    const REFS = REF_DEFS.filter((d) => !refOff(m.reference, d.key) && !refOff(opts.reference, d.key)).map((d) => Object.assign({}, d, {
+      ready: false,
+      L: { id: d.id, title: d.title, ref: true, visible: storeGet(d.store) !== "0", labels: d.labels } }));
+    const refWanted = REFS.length > 0;
     const hitIds = [];
     const coneIds = [];                            // photo cones are clickable too: a cone picks the photo facing that way
     const mapIds = {};                             // web layer id -> map layer ids (for the on/off switch)
@@ -289,36 +316,74 @@
     let maskOn = true;
 
     // add the property's layers as soon as the map's style is ready, without waiting for the background imagery
+    function addRefLayers(R, before, vis) {
+      const c = Object.fromEntries(R.classes.map((k) => [k[0], k]));
+      if (R.key === "waterways") {
+        const colour = ["match", ["get", "wclass"], "River", c.River[2], "Canal or race", c["Canal or race"][2],
+          "Stream or creek", c["Stream or creek"][2], "Drain", c.Drain[2], c["Small waterway"][2]];
+        const w = (k) => ["match", ["get", "wclass"], "River", k * 1.6, "Canal or race", k * 1.2, "Stream or creek", k, k * 0.7];
+        map.addLayer({ id: own(R.L, "ref-ww-small"), type: "line", source: R.src, "source-layer": "small", minzoom: 12,
+          layout: { visibility: vis, "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": colour, "line-opacity": 0.85,
+            "line-width": ["interpolate", ["exponential", 1.5], ["zoom"], 12, 0.5, 15, 1.2, 18, 2.6] } }, before);
+        map.addLayer({ id: own(R.L, "ref-ww-main"), type: "line", source: R.src, "source-layer": "main",
+          layout: { visibility: vis, "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": colour, "line-opacity": 0.95,
+            "line-width": ["interpolate", ["exponential", 1.5], ["zoom"], 7, w(0.5), 11, w(1.1), 14, w(1.8), 17, w(3.2), 20, w(5)] } }, before);
+        return;
+      }
+      // roads: minor (metalled, unmetalled dashed) under major (sealed, highways, each with a dark casing)
+      const building = ["==", ["get", "status"], "under construction"];
+      const minorW = ["interpolate", ["exponential", 1.5], ["zoom"], 11, 0.6, 14, 1.8, 18, 5];
+      const majorW = ["interpolate", ["exponential", 1.5], ["zoom"], 6, ["match", ["get", "rclass"], "highway", 0.8, 0.4],
+        10, ["match", ["get", "rclass"], "highway", 1.6, 0.9], 14, ["match", ["get", "rclass"], "highway", 4, 2.6],
+        18, ["match", ["get", "rclass"], "highway", 9, 7]];
+      const casingW = ["interpolate", ["exponential", 1.5], ["zoom"], 6, ["match", ["get", "rclass"], "highway", 1.8, 1.2],
+        10, ["match", ["get", "rclass"], "highway", 2.8, 1.9], 14, ["match", ["get", "rclass"], "highway", 6, 4.4],
+        18, ["match", ["get", "rclass"], "highway", 12, 10]];
+      const lay = { visibility: vis, "line-cap": "round", "line-join": "round" };
+      map.addLayer({ id: own(R.L, "ref-rd-metalled"), type: "line", source: R.src, "source-layer": "minor", minzoom: 11,
+        filter: ["all", ["==", ["get", "rclass"], "metalled"], ["!", building]], layout: lay,
+        paint: { "line-color": c.metalled[2], "line-opacity": 0.9, "line-width": minorW } }, before);
+      map.addLayer({ id: own(R.L, "ref-rd-unmetalled"), type: "line", source: R.src, "source-layer": "minor", minzoom: 11,
+        filter: ["any", ["==", ["get", "rclass"], "unmetalled"], building], layout: Object.assign({}, lay, { "line-cap": "butt" }),
+        paint: { "line-color": c.unmetalled[2], "line-opacity": 0.9, "line-width": minorW, "line-dasharray": [2.5, 2] } }, before);
+      map.addLayer({ id: own(R.L, "ref-rd-casing"), type: "line", source: R.src, "source-layer": "major", filter: ["!", building],
+        layout: lay, paint: { "line-color": "#1b1b1b", "line-opacity": 0.55, "line-width": casingW } }, before);
+      map.addLayer({ id: own(R.L, "ref-rd-major"), type: "line", source: R.src, "source-layer": "major", filter: ["!", building],
+        layout: lay, paint: { "line-color": ["match", ["get", "rclass"], "highway", c.highway[2], c.sealed[2]], "line-width": majorW } }, before);
+      map.addLayer({ id: own(R.L, "ref-rd-building"), type: "line", source: R.src, "source-layer": "major", filter: building,
+        layout: Object.assign({}, lay, { "line-cap": "butt" }),
+        paint: { "line-color": ["match", ["get", "rclass"], "highway", c.highway[2], c.sealed[2]], "line-width": majorW,
+          "line-dasharray": [2, 1.5] } }, before);
+    }
     function addReference() {
-      const urls = [opts.referenceUrl, new URL(REF_FILE, document.baseURI).href, REF_LIVE].filter(Boolean);
-      const probe = (i) => {
-        if (i >= urls.length) return;                         // not available here: the row stays hidden
-        fetch(urls[i], { headers: { Range: "bytes=0-6" } }).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject()))
-          .then((b) => {
-            if (new TextDecoder().decode(new Uint8Array(b).slice(0, 7)) !== "PMTiles") return probe(i + 1);
-            const own0 = new Set(Object.values(mapIds).flat());
-            const before = (map.getStyle().layers.find((l) => own0.has(l.id)) || {}).id || (map.getLayer("boundary-halo") ? "boundary-halo" : undefined);
-            map.addSource("ref-ww", { type: "vector", url: "pmtiles://" + urls[i], attribution: REF_CREDIT });
-            const colour = ["match", ["get", "wclass"], ...REF_CLASSES.slice(0, 2).flatMap(([k, c]) => [k, c]),
-              REF_CLASSES[2][0], REF_CLASSES[2][1], REF_CLASSES[4][0], REF_CLASSES[4][1], REF_CLASSES[3][1]];
-            const w = (k) => ["match", ["get", "wclass"], "River", k * 1.6, "Canal or race", k * 1.2, "Stream or creek", k, k * 0.7];
-            const vis = REF_L.visible ? "visible" : "none";
-            map.addLayer({ id: own(REF_L, "ref-ww-small"), type: "line", source: "ref-ww", "source-layer": "small", minzoom: 12,
-              layout: { visibility: vis, "line-cap": "round", "line-join": "round" },
-              paint: { "line-color": colour, "line-opacity": 0.85,
-                "line-width": ["interpolate", ["exponential", 1.5], ["zoom"], 12, 0.5, 15, 1.2, 18, 2.6] } }, before);
-            map.addLayer({ id: own(REF_L, "ref-ww-main"), type: "line", source: "ref-ww", "source-layer": "main",
-              layout: { visibility: vis, "line-cap": "round", "line-join": "round" },
-              paint: { "line-color": colour, "line-opacity": 0.95,
-                "line-width": ["interpolate", ["exponential", 1.5], ["zoom"], 7, w(0.5), 11, w(1.1), 14, w(1.8), 17, w(3.2), 20, w(5)] } }, before);
-            if (map.getLayer("mask")) map.moveLayer("mask", "ref-ww-small");     // shading under the waterways
-            refReady = true;
-            const row = root.querySelector(".rv-ref-row"), head = root.querySelector(".rv-ref-group");
-            if (row) row.hidden = false;
-            if (head) head.hidden = false;
-          }).catch(() => probe(i + 1));
-      };
-      probe(0);
+      REFS.forEach((R, ri) => {
+        const urls = [opts.referenceUrls && opts.referenceUrls[R.key], ri === 0 ? opts.referenceUrl : null,
+          new URL(R.file, document.baseURI).href, REF_LIVE_BASE + R.file].filter(Boolean);
+        const probe = (i) => {
+          if (i >= urls.length) return;                         // not available here: its row stays hidden
+          fetch(urls[i], { headers: { Range: "bytes=0-6" } }).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject()))
+            .then((b) => {
+              if (new TextDecoder().decode(new Uint8Array(b).slice(0, 7)) !== "PMTiles") return probe(i + 1);
+              // under the reference layers above this one (whichever loads first) and the property's own layers
+              const above = new Set(REFS.slice(ri + 1).flatMap((o) => mapIds[o.id] || []));
+              const ownIds = new Set(Object.entries(mapIds).filter(([k]) => !REFS.some((o) => o.id === k)).flatMap(([, v]) => v));
+              const before = (map.getStyle().layers.find((l) => above.has(l.id) || ownIds.has(l.id)) || {}).id ||
+                (map.getLayer("boundary-halo") ? "boundary-halo" : undefined);
+              map.addSource(R.src, { type: "vector", url: "pmtiles://" + urls[i], attribution: R.credit });
+              addRefLayers(R, before, R.L.visible ? "visible" : "none");
+              const refIds = new Set(REFS.flatMap((o) => mapIds[o.id] || []));
+              const lowest = (map.getStyle().layers.find((l) => refIds.has(l.id)) || {}).id;
+              if (map.getLayer("mask") && lowest) map.moveLayer("mask", lowest);     // shading under all reference layers
+              R.ready = true;
+              const row = root.querySelector(`.rv-ref-row[data-ref="${R.key}"]`), head = root.querySelector(".rv-ref-group");
+              if (row) row.hidden = false;
+              if (head) head.hidden = false;
+            }).catch(() => probe(i + 1));
+        };
+        probe(0);
+      });
     }
     let started = false;
     const setup = () => {
@@ -766,7 +831,7 @@
 
     // ---------------------------------------------------------------- labels
     const labelLayers = layers.filter((L) => L.labels && L.features);
-    if (refWanted) labelLayers.push(REF_L);                // last: the property's own labels win
+    REFS.forEach((R) => labelLayers.push(R.L));          // last: the property's own labels win
     let labelsOn = true;
     const labelBox = el("div", { class: "rv-labels", "aria-hidden": "true" });
     mapEl.insertBefore(labelBox, mapEl.querySelector(".maplibregl-control-container"));   // under controls and popups
@@ -918,32 +983,35 @@
       const t0 = performance.now();
       try { placeLabelsNow(); } finally { RCLViewer.stats.labelsMs = Math.round(performance.now() - t0); }
     }
-    // names along the reference waterways, from the tiles already loaded for this view (rivers, streams, canals)
+    // names along the reference layers (river names; road names and "SH 1"), from the tiles already loaded for this view
     function refLabels() {
-      labelData[REF_ID] = [];
-      if (!refReady || !layerOn(REF_L) || map.getZoom() < 10.75) return;
-      const by = {}, seenPart = new Set();
-      map.querySourceFeatures("ref-ww", { sourceLayer: "main" }).forEach((f) => {
-        const t = f.properties && f.properties.name, g = f.geometry;
-        if (!t || !g) return;
-        (g.type === "LineString" ? [g.coordinates] : g.type === "MultiLineString" ? g.coordinates : []).forEach((c) => {
-          if (c.length < 2) return;
-          const k = t + c[0].join() + c[c.length - 1].join();
-          if (seenPart.has(k)) return;                        // the same piece from a neighbouring tile
-          seenPart.add(k); (by[t] = by[t] || []).push(c);
-        });
+      const z = map.getZoom();
+      REFS.forEach((R) => {
+        labelData[R.id] = [];
+        if (!R.ready || !layerOn(R.L) || z < R.labelFrom) return;
+        const by = {}, seenPart = new Set();
+        R.labelLayers.forEach((sl) => map.querySourceFeatures(R.src, { sourceLayer: sl }).forEach((f) => {
+          const t = f.properties && R.labelText(f.properties, z), g = f.geometry;
+          if (!t || !g) return;
+          (g.type === "LineString" ? [g.coordinates] : g.type === "MultiLineString" ? g.coordinates : []).forEach((c) => {
+            if (c.length < 2) return;
+            const k = t + c[0].join() + c[c.length - 1].join();
+            if (seenPart.has(k)) return;                        // the same piece from a neighbouring tile
+            seenPart.add(k); (by[t] = by[t] || []).push(c);
+          });
+        }));
+        const out = [];
+        Object.entries(by).forEach(([t, parts]) => joinLines(parts).forEach((c) => {
+          const bb = bboxOf(c);
+          out.push({ text: t, type: "Line", bbox: bb, coords: c.length <= 300 ? c : c.filter((_, i) => i % Math.ceil(c.length / 280) === 0 || i === c.length - 1),
+            size: (bb[2] - bb[0]) + (bb[3] - bb[1]) });
+        }));
+        labelData[R.id] = out.sort((a, b) => b.size - a.size).slice(0, 200);   // the longest first, enough for one screen
       });
-      const out = [];
-      Object.entries(by).forEach(([t, parts]) => joinLines(parts).forEach((c) => {
-        const bb = bboxOf(c);
-        out.push({ text: t, type: "Line", bbox: bb, coords: c.length <= 300 ? c : c.filter((_, i) => i % Math.ceil(c.length / 280) === 0 || i === c.length - 1),
-          size: (bb[2] - bb[0]) + (bb[3] - bb[1]) });
-      }));
-      labelData[REF_ID] = out.sort((a, b) => b.size - a.size).slice(0, 250);   // the longest first, enough for one screen
     }
     let refTimer = null;
     map.on("sourcedata", (e) => {
-      if (e.sourceId !== "ref-ww" || !e.tile) return;
+      if (!REFS.some((R) => R.src === e.sourceId) || !e.tile) return;
       clearTimeout(refTimer); refTimer = setTimeout(placeLabels, 350);
     });
     function placeLabelsNow() {
@@ -1218,18 +1286,21 @@
 
     if (refWanted) {
       body.appendChild(el("div", { class: "rv-group rv-ref-group", hidden: "" }, "Reference"));
-      const row = el("div", { class: "rv-layer rv-ref-row" + (REF_L.visible ? "" : " off"), hidden: "" });
-      row.innerHTML = `<div class="rv-layer-row"><label for="rv-l-${REF_ID}"><input id="rv-l-${REF_ID}" class="rv-switch" type="checkbox" ${REF_L.visible ? "checked" : ""}><span>Waterways</span></label><span class="rv-count"></span></div>
-        <ul class="rv-legend">${REF_CLASSES.map(([k, c, w]) => `<li><img alt="" src="${lineIcon(c, w)}"><span>${esc(k)}</span></li>`).join("")}</ul>
-        <div class="rv-ref-note">${esc(REF_CREDIT)}</div>`;
-      row.dataset.from = 0; row.dataset.count = "";
-      body.appendChild(row);
-      row.querySelector("input").addEventListener("change", (e) => {
-        const on = e.target.checked;
-        REF_L.visible = on; storeSet("rv-ref-ww", on ? "1" : "0");
-        row.classList.toggle("off", !on);
-        (mapIds[REF_ID] || []).forEach((id) => map.getLayer(id) && map.setLayoutProperty(id, "visibility", on ? "visible" : "none"));
-        placeLabels();
+      REFS.slice().reverse().forEach((R) => {                // top first, like the map's own layers
+        const row = el("div", { class: "rv-layer rv-ref-row" + (R.L.visible ? "" : " off"), hidden: "" });
+        row.dataset.ref = R.key;
+        row.innerHTML = `<div class="rv-layer-row"><label for="rv-l-${R.id}"><input id="rv-l-${R.id}" class="rv-switch" type="checkbox" ${R.L.visible ? "checked" : ""}><span>${esc(R.title)}</span></label><span class="rv-count"></span></div>
+          <ul class="rv-legend">${R.classes.map(([, label, c, w, o]) => `<li><img alt="" src="${lineIcon(c, w, o)}"><span>${esc(label)}</span></li>`).join("")}</ul>
+          <div class="rv-ref-note">${esc(R.credit)}</div>`;
+        row.dataset.from = 0; row.dataset.count = "";
+        body.appendChild(row);
+        row.querySelector("input").addEventListener("change", (e) => {
+          const on = e.target.checked;
+          R.L.visible = on; storeSet(R.store, on ? "1" : "0");
+          row.classList.toggle("off", !on);
+          (mapIds[R.id] || []).forEach((id) => map.getLayer(id) && map.setLayoutProperty(id, "visibility", on ? "visible" : "none"));
+          placeLabels();
+        });
       });
     }
     if (maskRow) body.appendChild(maskRow);                // after the layers
@@ -1543,12 +1614,13 @@
         if (items.length === 1 && !items[0].label) blocks.push({ title: L.title, icon: items[0].src, items: [] });
         else blocks.push({ title: L.title, items: items.filter((g) => g.label) });
       });
-      if (refReady && layerOn(REF_L)) {
-        const ids = (mapIds[REF_ID] || []).filter((id) => map.getLayer(id));
-        const have = new Set(map.queryRenderedFeatures({ layers: ids }).map((f) => f.properties.wclass));
-        const items = REF_CLASSES.filter(([k]) => have.has(k)).map(([k, c, w]) => ({ label: k, src: lineIcon(c, w) }));
-        if (items.length) blocks.push({ title: "Waterways", items });
-      }
+      REFS.slice().reverse().forEach((R) => {
+        if (!R.ready || !layerOn(R.L)) return;
+        const ids = (mapIds[R.id] || []).filter((id) => map.getLayer(id));
+        const have = new Set(map.queryRenderedFeatures({ layers: ids }).map((f) => f.properties[R.prop]));
+        const items = R.classes.filter(([k]) => have.has(k)).map(([, label, c, w, o]) => ({ label, src: lineIcon(c, w, Object.assign({ casing: c === "#f2f2f2" ? "#777" : undefined }, o)) }));
+        if (items.length) blocks.push({ title: R.title, items });
+      });
       return blocks;
     }
     function paintLabels(g, k, list) {                               // the labels placed for print, into the picture
@@ -1628,7 +1700,7 @@
         const meta = [property, m.survey_date ? "Surveyed " + fmtDate(m.survey_date) : ""].filter(Boolean).join(" · ");
         const bmOn = ["aerial", "map"].find((k) => map.getLayoutProperty("bm-" + k, "visibility") !== "none");
         const credits = [bmOn ? String(BASEMAPS[bmOn].attribution || "").replace(/<[^>]*>/g, "") : "",
-          refReady && layerOn(REF_L) ? REF_CREDIT : "", threeD ? "Elevation: LINZ" : ""].filter(Boolean).join(" · ");
+          ...REFS.filter((R) => R.ready && layerOn(R.L)).map((R) => R.credit), threeD ? "Elevation: LINZ" : ""].filter(Boolean).join(" · ");
         const segs = sc ? [0, 1, 2, 3].map((i) => `<rect x="${(i * sc.mm) / 4}" y="0" width="${sc.mm / 4}" height="1.6" fill="${i % 2 ? "#fff" : "#1b2a24"}" stroke="#1b2a24" stroke-width=".25"/>`).join("") : "";
         const scale = sc ? `<div class="rv-pl-scale"><svg width="${sc.mm + 2}mm" height="2.2mm" viewBox="-1 -0.3 ${sc.mm + 2} 2.2">${segs}</svg>
             <div class="rv-pl-ticks" style="width:${sc.mm}mm"><span>0</span><span>${sc.half}</span><span>${sc.full} ${sc.unit}</span></div>
