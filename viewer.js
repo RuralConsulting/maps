@@ -182,6 +182,7 @@
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-right");
     map.addControl(new maplibregl.GeolocateControl({ trackUserLocation: false }), "top-right");
+    let toolMode = null;                           // "measure" while measuring: map clicks add points, no popups
 
     // ---------------------------------------------------------------- 3D: hills in relief, off until asked for
     // Elevation is only downloaded while 3D is on. Default: free terrain tiles (in NZ made from the LINZ 8 m DEM);
@@ -329,11 +330,12 @@
       }
 
       map.on("mousemove", (e) => {
-        if (picking) { map.getCanvas().style.cursor = "crosshair"; return; }
+        if (picking || toolMode === "measure") { map.getCanvas().style.cursor = "crosshair"; return; }
         const f = map.queryRenderedFeatures(box(e.point, 6), { layers: targetIds() });
         map.getCanvas().style.cursor = f.length ? "pointer" : "";
       });
       map.on("click", (e) => {
+        if (toolMode === "measure") return;           // the measure tool has its own click handler
         if (picking) return pickAt(e);
         const f = map.queryRenderedFeatures(box(e.point, 8), { layers: targetIds() });
         if (!f.length) { clearSelection(); closeSheet(); return; }
@@ -573,6 +575,7 @@
     banner.querySelector("button").addEventListener("click", cancelPick);
 
     function startPick() {
+      endTool();                                  // a tool and picking a spot don't mix
       clearSelection(); closeSheet();
       picking = true; banner.hidden = false; root.classList.add("rv-picking");
       if (narrow()) panel.classList.add("collapsed");
@@ -1135,6 +1138,303 @@
     };
     map.on("zoomend", zoomNotes);
     map.once("load", zoomNotes);
+
+    // ---------------------------------------------------------------- tools: compare (swipe), measure, print
+    const tools = el("div", { class: "maplibregl-ctrl maplibregl-ctrl-group rv-tools" });
+    const ICONS = {
+      compare: '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 2v16" stroke="currentColor" stroke-width="1.8"/><path d="M2.5 5 9 5 9 15 2.5 15Z" fill="currentColor" opacity=".35"/></svg>',
+      measure: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 13.5 13.5 2.5l4 4-11 11z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M6 10l1.6 1.6M8.5 7.5l1.6 1.6M11 5l1.6 1.6" stroke="currentColor" stroke-width="1.4"/></svg>',
+      print: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5.5 7V2.5h9V7" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="2.5" y="7" width="15" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5.5 11.5h9v6h-9z" fill="var(--btnbg, #fff)" stroke="currentColor" stroke-width="1.6"/></svg>',
+    };
+    const toolBtn = (key, title) => {
+      const b = el("button", { type: "button", "aria-pressed": "false", title, "aria-label": title });
+      b.innerHTML = ICONS[key];
+      tools.appendChild(b);
+      return b;
+    };
+    const rasters = layers.filter((L) => L.tiles);
+    const btnCompare = rasters.length >= 2 ? toolBtn("compare", "Compare two layers side by side (drag the divider)") : null;
+    const btnMeasure = toolBtn("measure", "Measure a distance or an area");
+    const btnPrint = toolBtn("print", "Print this view, or save it as a PDF");
+    map.addControl({ onAdd: () => tools, onRemove: () => tools.remove() }, "top-right");
+    let stopTool = null;                           // ends whichever tool is running
+    const startTool = (name, start) => {
+      if (stopTool) stopTool();
+      if (picking) cancelPick();
+      stopTool = start();
+      toolMode = name;
+    };
+    const endTool = () => { if (stopTool) { const f = stopTool; stopTool = null; toolMode = null; f(); } };
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && stopTool) endTool(); });
+
+    // ---- compare: a second map with the right-hand layer, over this one, cut off left of the divider
+    const isOn = (L) => (mapIds[L.id] || []).some((id) => map.getLayer(id) && map.getLayoutProperty(id, "visibility") !== "none");
+    const yearOf = (L) => { const y = String(L.title || "").match(/\b(19|20)\d{2}\b/); return y ? Number(y[0]) : null; };
+    function compareDefaults() {
+      const pool = rasters.filter((L) => L.kind === "imagery").length >= 2 ? rasters.filter((L) => L.kind === "imagery") : rasters;
+      const dated = pool.filter((L) => yearOf(L) != null).sort((a, b) => yearOf(a) - yearOf(b));
+      if (dated.length >= 2) return [dated[0], dated[dated.length - 1]];          // earliest left, latest right
+      return [pool[1], pool[0]];                                                 // QGIS order: top layer on the right
+    }
+    function startCompare() {
+      if (threeD) setThreeD(false);
+      clearSelection(); closeSheet();
+      let [left, right] = compareDefaults();
+      const before = Object.fromEntries(rasters.map((L) => [L.id, isOn(L)]));
+      const cmpEl = el("div", { class: "rv-compare-map", "aria-hidden": "true" });
+      mapEl.insertBefore(cmpEl, labelBox);
+      // the overlay is a copy of this map (same basemap, layers, labels' lines, photos) with the right-hand layer
+      // shown instead of the left-hand one; it follows every change made here
+      const tIds = (L) => (mapIds[L.id] || []).filter((id) => id.startsWith("t-"));
+      const overlayStyle = () => {
+        const st = JSON.parse(JSON.stringify(map.getStyle()));
+        delete st.terrain;
+        const leftIds = new Set(tIds(left)), rightIds = new Set(tIds(right));
+        st.layers = st.layers.filter((l) => l.id !== "hillshade").map((l) => {
+          if (leftIds.has(l.id)) l.layout = Object.assign({}, l.layout, { visibility: "none" });
+          if (rightIds.has(l.id)) l.layout = Object.assign({}, l.layout, { visibility: "visible" });
+          return l;
+        });
+        delete st.sources.dem; delete st.sources["dem-shade"];
+        return st;
+      };
+      const cmp = new maplibregl.Map({ container: cmpEl, style: overlayStyle(), interactive: false, attributionControl: false,
+        center: map.getCenter(), zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(), maxZoom: 22, maxPitch: 75 });
+      cmp.on("styleimagemissing", (e) => {                 // photo cones are drawn images: make them again here
+        const mm = /^cone-(.+)-(\d+)$/.exec(e.id);
+        const L = mm && layers.find((x) => x.id === mm[1]);
+        if (!L || !L.draw || cmp.hasImage(e.id)) return;
+        const c = (L.draw.colors && L.draw.colors[Number(mm[2])]) || "#e8590c";
+        cmp.addImage(e.id, coneCanvas(c, 128).getContext("2d").getImageData(0, 0, 128, 128), { pixelRatio: 2 });
+      });
+      const sync = () => cmp.jumpTo({ center: map.getCenter(), zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(), padding: map.getPadding() });
+      map.on("move", sync);
+      let restyle = 0;
+      const follow = () => { clearTimeout(restyle); restyle = setTimeout(() => cmp.setStyle(overlayStyle()), 60); };
+      map.on("styledata", follow);
+      const onResize = () => { cmp.resize(); sync(); place(divX); };
+      window.addEventListener("resize", onResize);
+      const showRight = follow;
+      const showLeft = () => rasters.forEach((L) => switches[L.id] && switches[L.id](L === left || (L !== right && before[L.id] && L.kind !== "imagery")));
+      // the bar: pick the two layers
+      const opt = (sel) => rasters.map((L) => `<option value="${esc(L.id)}"${L === sel ? " selected" : ""}>${esc(L.title)}</option>`).join("");
+      const bar = el("div", { class: "rv-toolbar rv-compare-bar", role: "group", "aria-label": "Compare layers" });
+      bar.innerHTML = `<label><span>Left</span><select class="rv-cmp-left">${opt(left)}</select></label>`
+        + `<label><span>Right</span><select class="rv-cmp-right">${opt(right)}</select></label>`
+        + `<button type="button" class="rv-btn rv-tool-done">Done</button>`;
+      root.appendChild(bar);
+      const byId = (id) => rasters.find((L) => L.id === id);
+      bar.querySelector(".rv-cmp-left").addEventListener("change", (e) => { left = byId(e.target.value); showLeft(); });
+      bar.querySelector(".rv-cmp-right").addEventListener("change", (e) => { right = byId(e.target.value); showLeft(); showRight(); });
+      bar.querySelector(".rv-tool-done").addEventListener("click", endTool);
+      // the divider
+      const divider = el("div", { class: "rv-divider", role: "slider", tabindex: "0", "aria-label": "Divider between the two layers",
+        "aria-valuemin": "0", "aria-valuemax": "100" });
+      divider.innerHTML = '<span class="rv-divider-handle" aria-hidden="true">‹ ›</span>';
+      root.appendChild(divider);
+      let divX = 0;
+      const place = (x) => {
+        const w = root.clientWidth;
+        divX = Math.max(0, Math.min(w, x));
+        cmpEl.style.clipPath = `inset(0 0 0 ${divX}px)`;
+        divider.style.left = divX + "px";
+        divider.setAttribute("aria-valuenow", String(Math.round((100 * divX) / Math.max(w, 1))));
+      };
+      const panelRight = () => (narrow() ? 0 : panel.getBoundingClientRect().right - root.getBoundingClientRect().left);
+      place((panelRight() + root.clientWidth) / 2);
+      divider.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        divider.setPointerCapture(e.pointerId);
+        const left0 = root.getBoundingClientRect().left;
+        const mv = (ev) => place(ev.clientX - left0);
+        const up = () => { divider.removeEventListener("pointermove", mv); divider.removeEventListener("pointerup", up); divider.removeEventListener("pointercancel", up); };
+        divider.addEventListener("pointermove", mv);
+        divider.addEventListener("pointerup", up);
+        divider.addEventListener("pointercancel", up);
+      });
+      divider.addEventListener("keydown", (e) => {
+        const step = e.shiftKey ? 60 : 15;
+        if (e.key === "ArrowLeft") { place(divX - step); e.preventDefault(); }
+        if (e.key === "ArrowRight") { place(divX + step); e.preventDefault(); }
+      });
+      root.classList.add("rv-comparing");
+      btnCompare.setAttribute("aria-pressed", "true");
+      showLeft();
+      showRight();
+      return () => {
+        map.off("move", sync); map.off("styledata", follow); clearTimeout(restyle);
+        window.removeEventListener("resize", onResize);
+        cmp.remove(); cmpEl.remove(); bar.remove(); divider.remove();
+        rasters.forEach((L) => switches[L.id] && switches[L.id](before[L.id]));
+        root.classList.remove("rv-comparing");
+        btnCompare.setAttribute("aria-pressed", "false");
+      };
+    }
+    if (btnCompare) btnCompare.addEventListener("click", () => (toolMode === "compare" ? endTool() : startTool("compare", startCompare)));
+
+    // ---- measure: distances along a line, or an area (both measured on the ground, curved earth)
+    const R_EARTH = 6371008.8;
+    const rad = (d) => (d * Math.PI) / 180;
+    const dist = (a, b) => {
+      const s = Math.sin(rad(b[1] - a[1]) / 2) ** 2 + Math.cos(rad(a[1])) * Math.cos(rad(b[1])) * Math.sin(rad(b[0] - a[0]) / 2) ** 2;
+      return 2 * R_EARTH * Math.asin(Math.min(1, Math.sqrt(s)));
+    };
+    const pathLength = (pts) => pts.slice(1).reduce((t, p, i) => t + dist(pts[i], p), 0);
+    const ringArea = (pts) => {                     // spherical polygon area (as used by turf), square metres
+      const n = pts.length;
+      if (n < 3) return 0;
+      let t = 0;
+      for (let i = 0; i < n; i++) {
+        const p1 = pts[i], p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n];
+        t += (rad(p3[0]) - rad(p1[0])) * Math.sin(rad(p2[1]));
+      }
+      return Math.abs((t * 6378137 * 6378137) / 2);
+    };
+    const fmtLen = (mtr) => (mtr < 1000 ? `${mtr < 10 ? mtr.toFixed(1) : Math.round(mtr)} m` : `${(mtr / 1000).toFixed(mtr < 10000 ? 2 : 1)} km`);
+    const fmtArea = (m2) => (m2 < 1000 ? `${Math.round(m2)} m²` : `${(m2 / 10000).toLocaleString("en-NZ", { maximumFractionDigits: m2 < 100000 ? 2 : 1 })} ha`);
+    RCLViewer.measure = { dist, pathLength, ringArea, fmtLen, fmtArea };   // for tests
+    function startMeasure() {
+      clearSelection(); closeSheet();
+      let kind = "line", pts = [], hover = null, done = false;
+      const dbl = map.doubleClickZoom.isEnabled();
+      map.doubleClickZoom.disable();
+      const fc = () => {
+        const all = hover && !done ? pts.concat([hover]) : pts;
+        const f = [];
+        if (kind === "area" && all.length >= 3) f.push({ type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [all.concat([all[0]])] } });
+        if (all.length >= 2) f.push({ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: kind === "area" && all.length >= 3 ? all.concat([all[0]]) : all } });
+        pts.forEach((p) => f.push({ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: p } }));
+        return { type: "FeatureCollection", features: f };
+      };
+      if (!map.getSource("measure")) {
+        map.addSource("measure", { type: "geojson", data: fc() });
+        map.addLayer({ id: "measure-fill", type: "fill", source: "measure", filter: ["==", ["geometry-type"], "Polygon"], paint: { "fill-color": "#fec956", "fill-opacity": 0.18 } });
+        map.addLayer({ id: "measure-halo", type: "line", source: "measure", filter: ["==", ["geometry-type"], "LineString"], paint: { "line-color": "#231f20", "line-width": 5, "line-opacity": 0.5 } });
+        map.addLayer({ id: "measure-line", type: "line", source: "measure", filter: ["==", ["geometry-type"], "LineString"], paint: { "line-color": "#fec956", "line-width": 2.5, "line-dasharray": [2, 1] } });
+        map.addLayer({ id: "measure-pts", type: "circle", source: "measure", filter: ["==", ["geometry-type"], "Point"], paint: { "circle-radius": 4.5, "circle-color": "#fff", "circle-stroke-color": "#231f20", "circle-stroke-width": 2 } });
+      }
+      const bar = el("div", { class: "rv-toolbar rv-measure-bar", role: "group", "aria-label": "Measure" });
+      bar.innerHTML = `<div class="rv-seg" role="radiogroup" aria-label="What to measure"><button type="button" data-k="line" aria-pressed="true">Distance</button><button type="button" data-k="area" aria-pressed="false">Area</button></div>`
+        + `<div class="rv-measure-out" aria-live="polite"></div>`
+        + `<button type="button" class="rv-link rv-m-undo">Undo</button><button type="button" class="rv-link rv-m-clear">Clear</button>`
+        + `<button type="button" class="rv-btn rv-m-finish">Finish</button><button type="button" class="rv-btn rv-tool-done">Close</button>`;
+      root.appendChild(bar);
+      const out = bar.querySelector(".rv-measure-out");
+      const draw = () => {
+        map.getSource("measure").setData(fc());
+        const all = hover && !done ? pts.concat([hover]) : pts;
+        if (!all.length) out.innerHTML = `<span class="rv-hint">${narrow() ? "Tap" : "Click"} the map to start${kind === "area" ? " outlining an area" : ""}</span>`;
+        else if (kind === "line") out.innerHTML = `<b>${esc(fmtLen(pathLength(all)))}</b>`;
+        else out.innerHTML = all.length < 3 ? `<span class="rv-hint">Add ${3 - all.length} more point${all.length === 2 ? "" : "s"}</span>`
+          : `<b>${esc(fmtArea(ringArea(all)))}</b><span class="rv-hint">perimeter ${esc(fmtLen(pathLength(all.concat([all[0]]))))}</span>`;
+        bar.querySelector(".rv-m-finish").hidden = done || pts.length < (kind === "area" ? 3 : 2);
+      };
+      const near = (a, b) => { const p = map.project(a), q = map.project(b); return Math.hypot(p.x - q.x, p.y - q.y) < 4; };
+      const onClick = (e) => {
+        const p = [e.lngLat.lng, e.lngLat.lat];
+        if (done) { pts = []; done = false; }
+        if (pts.length && near(pts[pts.length - 1], p)) return;          // the second click of a double-click
+        if (kind === "area" && pts.length >= 3 && near(pts[0], p)) { done = true; return draw(); }   // closed the shape
+        pts.push(p); draw();
+      };
+      const onMove = (e) => { if (!done && pts.length) { hover = [e.lngLat.lng, e.lngLat.lat]; draw(); } };
+      const onDbl = (e) => { e.preventDefault(); if (pts.length >= (kind === "area" ? 3 : 2)) { done = true; hover = null; draw(); } };
+      map.on("click", onClick); map.on("mousemove", onMove); map.on("dblclick", onDbl);
+      bar.querySelectorAll("[data-k]").forEach((b) => b.addEventListener("click", () => {
+        kind = b.dataset.k; done = false; hover = null;
+        bar.querySelectorAll("[data-k]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        draw();
+      }));
+      bar.querySelector(".rv-m-undo").addEventListener("click", () => { pts.pop(); done = false; draw(); });
+      bar.querySelector(".rv-m-clear").addEventListener("click", () => { pts = []; done = false; hover = null; draw(); });
+      bar.querySelector(".rv-m-finish").addEventListener("click", () => { done = true; hover = null; draw(); });
+      bar.querySelector(".rv-tool-done").addEventListener("click", endTool);
+      root.classList.add("rv-measuring");
+      btnMeasure.setAttribute("aria-pressed", "true");
+      draw();
+      return () => {
+        map.off("click", onClick); map.off("mousemove", onMove); map.off("dblclick", onDbl);
+        if (dbl) map.doubleClickZoom.enable();
+        pts = []; hover = null;
+        if (map.getSource("measure")) map.getSource("measure").setData({ type: "FeatureCollection", features: [] });
+        bar.remove();
+        map.getCanvas().style.cursor = "";
+        root.classList.remove("rv-measuring");
+        btnMeasure.setAttribute("aria-pressed", "false");
+      };
+    }
+    btnMeasure.addEventListener("click", () => (toolMode === "measure" ? endTool() : startTool("measure", startMeasure)));
+
+    // ---- print: a one-page layout (title, map, scale, north arrow, legend, credit), then the browser's print dialog
+    function niceScale(mpp, maxPx) {
+      const maxM = mpp * maxPx, p = 10 ** Math.floor(Math.log10(maxM));
+      const n = [5, 2, 1].map((k) => k * p).find((v) => v <= maxM) || p;
+      return { metres: n, px: n / mpp, label: n >= 1000 ? `${n / 1000} km` : `${n} m` };
+    }
+    function legendFor(L) {
+      if (L.draw) {
+        const colors = L.draw.colors && L.draw.colors.length ? L.draw.colors : ["#e8590c"];
+        const lg = L.legend || [];
+        return lg.length > 1 ? lg.map((g, i) => ({ label: g.label, src: legendIcon(colors[i] || colors[0], L.draw.type === "direction") }))
+          : [{ label: "", src: legendIcon(colors[0], L.draw.type === "direction") }];
+      }
+      return (L.legend || []).map((g) => ({ label: g.label, src: url(g.icon) }));
+    }
+    function printView() {
+      const canvas = map.getCanvas();
+      map.once("render", () => {
+        let img;
+        try { img = canvas.toDataURL("image/png"); } catch (e) { img = null; }   // read during the frame: no extra GPU memory
+        if (!img) { alert("Sorry, this map view can't be printed in this browser."); return; }
+        const w = mapEl.clientWidth, h = mapEl.clientHeight;
+        const zoom = map.getZoom(), lat = map.getCenter().lat;
+        const mpp = (40075016.686 * Math.cos(rad(lat))) / (512 * 2 ** zoom);
+        const room = layers.some((L) => isOn(L)) ? 800 : 1010;     // landscape page, legend beside the map
+        const pz = Math.min(1, room / w, 560 / h);                   // the map image is shrunk by this to fit
+        const sc = map.getPitch() < 5 ? niceScale(mpp / pz, 180) : null;   // measured on the printed image
+        const shown = layers.filter((L) => isOn(L));
+        const legend = shown.map((L) => {
+          const items = legendFor(L);
+          const head = items.length === 1 && !items[0].label
+            ? `<li class="rv-pl-layer"><img alt="" src="${esc(items[0].src)}"><span>${esc(L.title)}</span></li>`
+            : `<li class="rv-pl-layer"><span>${esc(L.title)}</span></li>`
+              + items.filter((g) => g.label).map((g) => `<li><img alt="" src="${esc(g.src)}"><span>${esc(g.label)}</span></li>`).join("");
+          return head;
+        }).join("");
+        const property = m.property && m.property !== (m.map_title || m.title) ? m.property : "";
+        const meta = [property, m.survey_date ? "Surveyed " + fmtDate(m.survey_date) : ""].filter(Boolean).join(" · ");
+        const bmOn = ["aerial", "map"].find((k) => map.getLayoutProperty("bm-" + k, "visibility") !== "none");
+        const credit = [bmOn ? String(BASEMAPS[bmOn].attribution || "").replace(/<[^>]*>/g, "") : "", "Rural Consulting Limited"].filter(Boolean).join(" · ");
+        const labels = labelBox.cloneNode(true);
+        labels.classList.add("rv-pl-labels");
+        const sheet = el("div", { class: "rv-print" });
+        sheet.innerHTML = `<header class="rv-pl-head"><img class="rv-pl-logo" src="brand/logo.png" alt="Rural Consulting">
+            <div><div class="rv-pl-title">${esc(m.map_title || m.title)}</div><div class="rv-pl-meta">${esc(meta)}</div></div></header>
+          <div class="rv-pl-body">
+            <div class="rv-pl-mapcol"><figure class="rv-pl-fig" style="width:${w}px;height:${h}px"><img class="rv-pl-map" alt="Map" src="${img}"></figure>
+              <div class="rv-pl-cap">
+                ${sc ? `<div class="rv-pl-scale"><div style="width:${sc.px.toFixed(1)}px"></div><span>${esc(sc.label)}</span></div>` : `<div class="rv-pl-scale"><span>Tilted view, not to scale</span></div>`}
+                <div class="rv-pl-north" aria-label="North"><span style="transform:rotate(${-map.getBearing()}deg)">▲</span>N</div>
+              </div></div>
+            ${legend ? `<aside class="rv-pl-legend"><div class="rv-pl-lh">Legend</div><ul>${legend}</ul></aside>` : ""}
+          </div>
+          <footer class="rv-pl-foot"><span>${esc(credit)}</span><span>Printed ${esc(new Date().toLocaleDateString("en-NZ", { day: "numeric", month: "long", year: "numeric" }))}</span></footer>`;
+        sheet.querySelector(".rv-pl-fig").appendChild(labels);
+        sheet.style.setProperty("--pz", String(pz));
+        document.body.appendChild(sheet);
+        document.body.classList.add("rv-printing");
+        let cleaned = false;
+        const clean = () => { if (cleaned) return; cleaned = true; sheet.remove(); document.body.classList.remove("rv-printing"); window.removeEventListener("afterprint", clean); };
+        window.addEventListener("afterprint", clean);
+        const imgs = [...sheet.querySelectorAll("img")];
+        Promise.all(imgs.map((i) => (i.complete ? null : new Promise((r) => { i.onload = i.onerror = r; })))).then(() => {
+          window.print();
+          setTimeout(clean, 1000);                   // browsers that don't send afterprint
+        });
+      });
+      map.triggerRepaint();
+    }
+    btnPrint.addEventListener("click", () => { endTool(); printView(); });
     return map;
   }
 
