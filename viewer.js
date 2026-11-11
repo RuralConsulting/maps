@@ -4,6 +4,8 @@
  *   suggest?: { list: async () => [suggestion], submit: async (draft) => void,      // portal only
  *              focus?: suggestionId, manage?: (suggestion) => void }                // staff: open in the inbox
  *   shared?: [layer entry or null, one for each of manifest.shared_layers]          // platform: layers published once, see mergeShared
+ *   referenceLayers?: [{ key: "roads" | "waterways", url, title?, credit? }]         // platform: where the reference layers are, see referenceDefs
+ *                   + [{ key, url, title, credit, style: { source_layer, layers, legend } }] // platform: context layers, see contextDefs
  * })
  * Works for the local preview (url = identity) and the customer portal (url = signed link).
  */
@@ -43,6 +45,81 @@
     const c = layer.classes;
     if (c.kind === "categories") return c.values[props._cls] ? c.values[props._cls][1] : null;
     return c.ranges[props._cls] ? c.ranges[props._cls][2] : null;
+  }
+  // a title or legend label that says nothing ("default" from a style, the plugin's stand-in "Other" for unnamed symbols)
+  const said = (t) => t != null && String(t).trim() !== "" && !/^(default|null|none|untitled)$/i.test(String(t).trim());
+  // a feature's title in its details: its own title, else its class, else (a photo) its file name, else the layer's name
+  function featureTitle(L, p, cls) {
+    if (said(p._label)) return String(p._label);
+    if (said(cls)) return String(cls);
+    if (p._photo) {
+      const file = Object.values(p).find((v) => typeof v === "string" && /^[^\\/]+\.(jpe?g|png|tiff?|heic|webp|dng)$/i.test(v.trim()));
+      if (!file) return "Photo";
+      if (/\s/.test(file.trim())) return file.trim();
+      const n = file.replace(/\.[^.]+$/, "").match(/\d+/g);   // DJI_0043.JPG reads as "Photo 0043", as the plugin's own titles do
+      return n ? "Photo " + n[n.length - 1] : file.trim();
+    }
+    return L.title;
+  }
+  // the legend of a layer the web map draws itself (photo dots and cones): [{i, label, color}]. When QGIS named none of the
+  // symbols (the plugin then writes "Other" for each), the category's own label or value is used, or one plain entry is shown.
+  function drawLegend(L) {
+    const colors = L.draw.colors && L.draw.colors.length ? L.draw.colors : ["#e8590c"];
+    const lg = L.legend || [];
+    const plain = [{ i: 0, label: L.draw.type === "direction" ? "Photo, cone shows the view" : "", color: colors[0] }];
+    if (lg.length <= 1) return plain;
+    const seen = {};
+    lg.forEach((g) => { const k = String(g.label || "").trim().toLowerCase(); seen[k] = (seen[k] || 0) + 1; });
+    const c = L.classes || {};
+    const items = lg.map((g, i) => {
+      let label = String(g.label || "").trim();
+      if (!said(label) || (label.toLowerCase() === "other" && seen.other > 1)) {
+        const v = c.kind === "categories" ? c.values && c.values[i] : c.ranges && c.ranges[i];
+        const named = v && (c.kind === "categories" ? v[1] : v[2]);
+        const value = v && c.kind === "categories" && !Array.isArray(v[0]) ? v[0] : null;
+        label = said(named) ? String(named) : said(value) ? String(value) : "";
+      }
+      return { i, label, color: colors[i] || colors[0] };
+    });
+    return items.some((g) => g.label) ? items.map((g) => (g.label ? g : Object.assign(g, { label: "Other" }))) : plain;
+  }
+  // an enlarged photo closes with its Close button, Esc, or a click beside the photo
+  function lightboxWire(lb, doc) {
+    const close = () => { lb.remove(); doc.removeEventListener("keydown", onKey); };
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    lb.addEventListener("click", (e) => { if (e.target === lb || (e.target.closest && e.target.closest(".rv-lightbox-close"))) close(); });
+    doc.addEventListener("keydown", onKey);
+    return close;
+  }
+  // the whole-property view: top down and north up, however the map was turned or tilted (a photo's view, 3D)
+  const wholeView = (padding) => ({ padding, bearing: 0, pitch: 0, freezeElevation: true });
+  // The photo view: the map looks the way a photo's camera did, with the hills in 3D. Leaving it puts back the view and the
+  // 3D (or 2D) the person had before; stepping from photo to photo keeps that first view to go back to.
+  // cam: { get() -> camera, threeD() -> bool, setThreeD(on), look(view), move(camera), whole() }
+  function photoViewState(cam) {
+    let before = null;
+    const back3d = (b) => { if (cam.threeD() !== b.threeD) cam.setThreeD(b.threeD); };
+    return {
+      active: () => !!before,
+      enter(view) {
+        if (!before) before = { camera: cam.get(), threeD: cam.threeD() };
+        if (!cam.threeD()) cam.setThreeD(true);
+        cam.look(view);
+      },
+      leave() {                                    // back to the view from before (or, not known, the whole property)
+        if (!before) return false;
+        const b = before; before = null;
+        back3d(b);
+        if (b.camera) cam.move(b.camera); else cam.whole();
+        return true;
+      },
+      end() {                                      // the map is going somewhere else: only the 3D (or 2D) goes back
+        if (!before) return false;
+        const b = before; before = null;
+        back3d(b);
+        return true;
+      },
+    };
   }
 
   // ---- drawn symbols for photo-style point layers: a dot plus a cone showing which way the camera faced
@@ -108,6 +185,145 @@
       .replace(/\bMc([a-z])/g, (_, b) => "Mc" + b.toUpperCase()).replace(/\b(Sh|Nz)\b/g, (x) => x.toUpperCase());
   }
   const REF_LIVE_BASE = "https://maps.ruralconsulting.co.nz/";
+  // The reference layers a map draws, bottom first, each with the places its file may be (tried in order). Without
+  // opts.referenceLayers: every one the map does not turn off, from opts.referenceUrls / opts.referenceUrl, then this site's ref/
+  // folder, then the live portal. With it (the platform app: its signed links to the files it stores once, [{ key, url, title,
+  // credit }]): only those listed with a url, each from that url alone, under its own title and credit; the rest are not drawn.
+  // "reference": false on the map, or in opts.reference, still turns them off either way.
+  function referenceDefs(m, opts, base) {
+    const refOff = (r, key) => r === false || (r && typeof r === "object" && r[key] === false);
+    const on = REF_DEFS.filter((d) => !refOff(m.reference, d.key) && !refOff(opts.reference, d.key));
+    if (!Array.isArray(opts.referenceLayers)) {
+      return on.map((d, ri) => Object.assign({}, d, { urls: [opts.referenceUrls && opts.referenceUrls[d.key], ri === 0 ? opts.referenceUrl : null,
+        new URL(d.file, base).href, REF_LIVE_BASE + d.file].filter(Boolean) }));
+    }
+    const plain = (t) => String(t).replace(/[<>]/g, "");      // the map's attribution line is HTML
+    return on.flatMap((d) => {
+      const g = opts.referenceLayers.find((r) => r && r.key === d.key && !r.style && typeof r.url === "string" && r.url);
+      return g ? [Object.assign({}, d, { title: g.title ? plain(g.title) : d.title, credit: g.credit ? plain(g.credit) : d.credit, urls: [g.url] })] : [];
+    });
+  }
+  // Context layers (catchments, zones, protected land...): referenceLayers entries that carry their own style, drawn from their
+  // file unclipped, under the map's own layers, off until switched on. style: { source_layer, layers: [MapLibre fill, line,
+  // circle or symbol layer definitions against that source layer], legend: [{ label, fill?, outline?, opacity?, line?, width?,
+  // dash?, circle?, stroke? }] }. Only those four types, their paint, layout, filter and zooms are taken; the source is the
+  // entry's own. A symbol layer is not drawn by MapLibre (the map has no font server): its text-field (["get", field], or a
+  // "concat" of strings and gets) names the features with the viewer's own labels, from its minzoom, in its text colour and
+  // halo. Titles, credits and legend labels are plain text and colours hex only. "reference": false turns these off too.
+  // A symbol layer may name its own "source-layer" in the same file: the build's one point per area (<key>-labels), so each area
+  // is named once, centred, not once per tile piece; a point's "label_r" (metres from its edge) leaves out areas too small on
+  // screen for their name. Its text-color may be a "match" on a field (each zone named in its own hue); "text-transform":
+  // "uppercase", "text-letter-spacing" (em), "text-padding" (px kept clear around it), "symbol-spacing" (px between a line's
+  // names) and a maxzoom are taken too.
+  const CTX_TYPES = ["fill", "line", "circle", "symbol"];
+  const hexOnly = (v) => (/^#[0-9a-f]{3,8}$/i.test(String(v || "")) ? String(v) : null);
+  // a label colour: a hex, or ["match", ["get", field], value, hex, ..., fallback hex] -> {field, map, fallback}
+  function colourRule(v) {
+    if (hexOnly(v)) return hexOnly(v);
+    if (!Array.isArray(v) || v[0] !== "match" || !Array.isArray(v[1]) || v[1][0] !== "get" || typeof v[1][1] !== "string" || v.length < 5) return null;
+    const map = {};
+    for (let i = 2; i < v.length - 1; i += 2) if (hexOnly(v[i + 1]) && (typeof v[i] === "string" || typeof v[i] === "number")) map[v[i]] = v[i + 1];
+    return { field: v[1][1], map, fallback: hexOnly(v[v.length - 1]) || "#1b1b1b" };
+  }
+  const colourFor = (rule, p) => (!rule ? null : typeof rule === "string" ? rule : rule.map[p[rule.field]] || rule.fallback);
+  function contextDefs(m, opts) {
+    if (!Array.isArray(opts.referenceLayers)) return [];
+    const refOff = (r, key) => r === false || (r && typeof r === "object" && r[key] === false);
+    const plain = (t) => String(t).replace(/[<>]/g, "");
+    const obj = (o) => (o && typeof o === "object" && !Array.isArray(o) ? Object.assign({}, o) : {});
+    const num = (v) => (typeof v === "number" && isFinite(v) ? v : undefined);
+    const seen = new Set();
+    return opts.referenceLayers.flatMap((r) => {
+      const st = r && r.style;
+      if (!st || typeof st !== "object" || !Array.isArray(st.layers) || typeof r.url !== "string" || !r.url) return [];
+      const key = String(r.key || "").toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 80);
+      if (!key || seen.has(key) || typeof st.source_layer !== "string" || !st.source_layer) return [];
+      if (refOff(m.reference, key) || refOff(opts.reference, key)) return [];
+      seen.add(key);
+      const layers = [];
+      let labels = null;
+      st.layers.forEach((x) => {
+        if (!x || !CTX_TYPES.includes(x.type)) return;
+        if (x.type === "symbol") {
+          const lay = obj(x.layout), paint = obj(x.paint);
+          if (labels || !lay["text-field"]) return;
+          const font = Array.isArray(lay["text-font"]) ? lay["text-font"].join(" ") : "";
+          const rule = colourRule(paint["text-color"]);
+          labels = { text: lay["text-field"], minzoom: num(x.minzoom) ?? 0, size: num(lay["text-size"]) || 12,
+            color: typeof rule === "string" ? rule : rule ? rule.fallback : "#1b1b1b", halo: hexOnly(paint["text-halo-color"]) || "#ffffff",
+            italic: /italic/i.test(font), bold: /bold/i.test(font) };
+          // CL3: only what is given, so a layer without these reads exactly as before
+          const sl = x["source-layer"];
+          if (typeof sl === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(sl)) labels.sourceLayer = sl;
+          if (rule && typeof rule === "object") labels.colorBy = rule;
+          if (lay["text-transform"] === "uppercase") labels.upper = true;
+          if (num(lay["text-letter-spacing"]) !== undefined) labels.spacing = Math.min(Math.max(lay["text-letter-spacing"], 0), 0.5);
+          if (num(lay["text-padding"]) !== undefined) labels.padding = Math.min(Math.max(lay["text-padding"], 0), 40);
+          if (num(lay["symbol-spacing"]) !== undefined) labels.repeat = Math.min(Math.max(lay["symbol-spacing"], 150), 2000);
+          if (num(x.maxzoom) !== undefined) labels.maxzoom = x.maxzoom;
+          return;
+        }
+        const d = { type: x.type, paint: obj(x.paint), layout: obj(x.layout) };
+        if (Array.isArray(x.filter)) d.filter = x.filter;
+        if (num(x.minzoom) !== undefined) d.minzoom = x.minzoom;
+        if (num(x.maxzoom) !== undefined) d.maxzoom = x.maxzoom;
+        layers.push(d);
+      });
+      const legend = (Array.isArray(st.legend) ? st.legend : []).filter((e) => e && typeof e === "object").slice(0, 40).map((e) => ({
+        label: plain(e.label || ""), fill: hexOnly(e.fill), outline: hexOnly(e.outline), line: hexOnly(e.line), circle: hexOnly(e.circle),
+        stroke: hexOnly(e.stroke), opacity: num(e.opacity), width: num(e.width), dash: Array.isArray(e.dash) ? e.dash.filter((v) => num(v) !== undefined) : null,
+        casing: hexOnly(e.casing) }));
+      const def = { key, id: "ctx-" + key, src: "ctx-src-" + key, store: "rv-ctx-" + key, title: plain(r.title || key),
+        credit: plain(r.credit || ""), url: r.url, sourceLayer: st.source_layer, layers, labels, legend };
+      if (typeof st.note === "string" && st.note.trim()) def.note = plain(st.note).trim().slice(0, 300);   // CL3: one line under the legend
+      return [def];
+    });
+  }
+  // a context layer's label text for a feature: ["get", f], ["to-string", e], ["concat", ...] or a plain string; "" when a field is empty
+  function contextText(e, p) {
+    if (typeof e === "string") return e;
+    if (typeof e === "number") return String(e);
+    if (!Array.isArray(e)) return "";
+    if (e[0] === "get") { const v = p[e[1]]; return v == null ? "" : String(v).trim(); }
+    if (e[0] === "to-string") return contextText(e[1], p);
+    if (e[0] === "concat") {
+      const parts = e.slice(1).map((x) => [x, contextText(x, p)]);
+      return parts.some(([x, t]) => Array.isArray(x) && t === "") ? "" : parts.map(([, t]) => t).join("");
+    }
+    return "";
+  }
+  // a context layer's legend picture: an area as a solid chip of its colour (not its see-through fill, which turns muddy on the
+  // dark panel) with its outline inside a thin light edge and a faint dark one, readable on the dark and the light panel; a
+  // line as a short sample on its light casing; a point as a dot with its ring
+  function contextIcon(e) {
+    const c = document.createElement("canvas"); c.width = 40; c.height = 40;
+    const g = c.getContext("2d");
+    if (e.line && !e.fill) {
+      const w = Math.max(2, (e.width || 1.5) * 2), path = () => { g.beginPath(); g.moveTo(5, 26); g.bezierCurveTo(14, 12, 25, 32, 35, 16); };
+      g.lineCap = "round"; g.lineJoin = "round";
+      path(); g.lineWidth = w + 5; g.strokeStyle = "rgba(0,0,0,0.25)"; g.stroke();         // a faint dark edge: the casing shows on white
+      path(); g.lineWidth = w + 4; g.strokeStyle = e.casing || "#ffffff"; g.globalAlpha = e.casing ? 0.9 : 0.6; g.stroke(); g.globalAlpha = 1;
+      path(); g.lineWidth = w; g.strokeStyle = e.line;
+      if (e.dash && e.dash.length) { g.lineCap = "butt"; g.setLineDash(e.dash.map((v) => v * 2)); }
+      g.stroke();
+    } else if (e.circle) {
+      g.beginPath(); g.arc(20, 20, 9, 0, 2 * Math.PI); g.fillStyle = e.circle; g.fill();
+      g.lineWidth = 3; g.strokeStyle = e.stroke || "#ffffff"; g.stroke();
+      g.beginPath(); g.arc(20, 20, 11, 0, 2 * Math.PI); g.lineWidth = 1; g.strokeStyle = "rgba(0,0,0,0.35)"; g.stroke();   // shows a white ring on white
+    } else {
+      const chip = () => { g.beginPath(); if (g.roundRect) g.roundRect(6, 6, 28, 28, 4); else g.rect(6, 6, 28, 28); };
+      chip(); g.lineWidth = 4; g.strokeStyle = "rgba(0,0,0,0.3)"; g.stroke();                // the faint dark edge, outermost
+      chip(); g.lineWidth = 2; g.strokeStyle = "rgba(255,255,255,0.9)"; g.stroke();          // the thin light edge
+      chip(); g.fillStyle = e.fill || e.outline || "#b0b0b0"; g.fill();                       // the colour itself, solid
+      const o = e.outline && e.fill ? e.outline : null;
+      if (o) {
+        g.beginPath(); g.rect(8.5, 8.5, 23, 23); g.lineWidth = 3; g.strokeStyle = o;
+        if (e.dash && e.dash.length) g.setLineDash(e.dash.map((v) => v * 1.5));
+        g.stroke();
+      }
+    }
+    return c.toDataURL("image/png");
+  }
   function colorExpr(colors) {
     if (!colors || !colors.length) return "#e8590c";
     if (colors.length === 1) return colors[0];
@@ -259,7 +475,11 @@
       opts.terrain || RCLViewer.terrain || {
         tiles: ["https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"], encoding: "terrarium",
         attribution: "Elevation: Mapzen terrain tiles (LINZ 8 m DEM)" });
-    function setThreeD(on) {
+    // auto: switched by the photo view, which moves the map itself (no tilt here) and leaves the person's own choice saved.
+    // Every move with the hills on passes freezeElevation: MapLibre (5.x) otherwise keeps the ground height it guessed when
+    // the move began (sea level, if 3D has only just been switched on and no elevation tile has arrived) and stops following
+    // the ground afterwards, so the camera can end up inside a hill: a large flat blank wedge across the map.
+    function setThreeD(on, auto) {
       threeD = on;
       btn3d.setAttribute("aria-pressed", String(on));
       if (on) {
@@ -281,14 +501,14 @@
         });
         map.setTerrain({ source: "dem", exaggeration: 1.4 });
         map.once("idle", () => typeof placeLabels === "function" && placeLabels());
-        map.easeTo({ pitch: 62, bearing: map.getBearing() || -20, duration: 900 });
+        if (!auto) onGround(map.getCenter(), () => threeD && map.easeTo({ pitch: 62, bearing: map.getBearing() || -20, duration: 900, freezeElevation: true }));
       } else {
         map.setTerrain(null);
         if (map.getLayer("hillshade")) map.setLayoutProperty("hillshade", "visibility", "none");
         Object.entries(fillOpacity).forEach(([id, v]) => map.getLayer(id) && map.setPaintProperty(id, "fill-opacity", v));
-        map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
+        if (!auto) map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
       }
-      storeSet("rv-3d", on ? "1" : "");
+      if (!auto) storeSet("rv-3d", on ? "1" : "");
     }
     const ctl3d = el("div", { class: "maplibregl-ctrl maplibregl-ctrl-group rv-3d" });
     const btn3d = el("button", { type: "button", "aria-pressed": "false", title: "Show the hills in 3D (drag with the right mouse button, or two fingers, to tilt and turn)" }, "3D");
@@ -303,11 +523,19 @@
     layers.forEach((L) => { if (L.exclusive && L.visible) { if (exOn[L.group]) L.visible = false; else exOn[L.group] = true; } });
     // reference layers (waterways, roads): drawn under the property's layers and over the outside shading.
     // Off for a map with "reference": false, or one at a time with "reference": {"roads": false}
-    const refOff = (r, key) => r === false || (r && typeof r === "object" && r[key] === false);
-    const REFS = REF_DEFS.filter((d) => !refOff(m.reference, d.key) && !refOff(opts.reference, d.key)).map((d) => Object.assign({}, d, {
+    const REFS = referenceDefs(m, opts, document.baseURI).map((d) => Object.assign({}, d, {
       ready: false,
       L: { id: d.id, title: d.title, ref: true, visible: storeGet(d.store) !== "0", labels: d.labels } }));
     const refWanted = REFS.length > 0;
+    // context layers (platform core layers with their own style): off until switched on, remembered on this device
+    const CTX = contextDefs(m, opts).map((d) => Object.assign({}, d, {
+      ready: false,
+      L: { id: d.id, title: d.title, ctx: true, visible: storeGet(d.store) === "1", labels: d.labels } }));
+    // where each context and reference map layer sits, bottom first: areas, then lines, then roads and waterways, then points;
+    // all of them under the property's own layers
+    const CTX_Z = { fill: 1, line: 2, circle: 4 }, REF_Z = 3;
+    const stackZ = {};
+    const ctxIdsAbove = (z) => CTX.flatMap((o) => mapIds[o.id] || []).filter((id) => stackZ[id] > z);
     const hitIds = [];
     const coneIds = [];                            // photo cones are clickable too: a cone picks the photo facing that way
     const mapIds = {};                             // web layer id -> map layer ids (for the on/off switch)
@@ -359,21 +587,21 @@
     }
     function addReference() {
       REFS.forEach((R, ri) => {
-        const urls = [opts.referenceUrls && opts.referenceUrls[R.key], ri === 0 ? opts.referenceUrl : null,
-          new URL(R.file, document.baseURI).href, REF_LIVE_BASE + R.file].filter(Boolean);
+        const urls = R.urls;
         const probe = (i) => {
           if (i >= urls.length) return;                         // not available here: its row stays hidden
           fetch(urls[i], { headers: { Range: "bytes=0-6" } }).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject()))
             .then((b) => {
               if (new TextDecoder().decode(new Uint8Array(b).slice(0, 7)) !== "PMTiles") return probe(i + 1);
               // under the reference layers above this one (whichever loads first) and the property's own layers
-              const above = new Set(REFS.slice(ri + 1).flatMap((o) => mapIds[o.id] || []));
-              const ownIds = new Set(Object.entries(mapIds).filter(([k]) => !REFS.some((o) => o.id === k)).flatMap(([, v]) => v));
+              const above = new Set(REFS.slice(ri + 1).flatMap((o) => mapIds[o.id] || []).concat(ctxIdsAbove(REF_Z)));
+              const ownIds = new Set(Object.entries(mapIds).filter(([k]) => !REFS.some((o) => o.id === k) && !CTX.some((o) => o.id === k)).flatMap(([, v]) => v));
               const before = (map.getStyle().layers.find((l) => above.has(l.id) || ownIds.has(l.id)) || {}).id ||
                 (map.getLayer("boundary-halo") ? "boundary-halo" : undefined);
               map.addSource(R.src, { type: "vector", url: "pmtiles://" + urls[i], attribution: R.credit });
               addRefLayers(R, before, R.L.visible ? "visible" : "none");
-              const refIds = new Set(REFS.flatMap((o) => mapIds[o.id] || []));
+              (mapIds[R.id] || []).forEach((id) => { stackZ[id] = REF_Z + ri * 0.01; });
+              const refIds = new Set(REFS.concat(CTX).flatMap((o) => mapIds[o.id] || []));
               const lowest = (map.getStyle().layers.find((l) => refIds.has(l.id)) || {}).id;
               if (map.getLayer("mask") && lowest) map.moveLayer("mask", lowest);     // shading under all reference layers
               R.ready = true;
@@ -383,6 +611,38 @@
             }).catch(() => probe(i + 1));
         };
         probe(0);
+      });
+    }
+    // context layers: each from its own file, once it answers as a PMTiles file; each map layer slotted in by its kind
+    function addContext() {
+      CTX.forEach((C, ci) => {
+        fetch(C.url, { headers: { Range: "bytes=0-6" } }).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject()))
+          .then((b) => {
+            if (new TextDecoder().decode(new Uint8Array(b).slice(0, 7)) !== "PMTiles") return;
+            map.addSource(C.src, { type: "vector", url: "pmtiles://" + C.url, attribution: C.credit });
+            const vis = C.L.visible ? "visible" : "none";
+            C.layers.forEach((d, j) => {
+              const z = CTX_Z[d.type] + ci * 0.001 + j * 0.00001;
+              const ownIds = new Set(Object.entries(mapIds).filter(([k]) => !REFS.some((o) => o.id === k) && !CTX.some((o) => o.id === k)).flatMap(([, v]) => v));
+              const before = (map.getStyle().layers.find((l) => stackZ[l.id] > z || ownIds.has(l.id)) || {}).id ||
+                (map.getLayer("boundary-halo") ? "boundary-halo" : undefined);
+              const id = `${C.id}-${j}`;
+              const def = Object.assign({ id, type: d.type, source: C.src, "source-layer": C.sourceLayer, paint: d.paint,
+                layout: Object.assign({}, d.layout, { visibility: vis }) }, d.filter ? { filter: d.filter } : {},
+                d.minzoom !== undefined ? { minzoom: d.minzoom } : {}, d.maxzoom !== undefined ? { maxzoom: d.maxzoom } : {});
+              try { map.addLayer(def, before); } catch (e) { return; }      // a definition MapLibre refuses is left out
+              if (!map.getLayer(id)) return;
+              own(C.L, id); stackZ[id] = z;
+            });
+            const all = new Set(REFS.concat(CTX).flatMap((o) => mapIds[o.id] || []));
+            const lowest = (map.getStyle().layers.find((l) => all.has(l.id)) || {}).id;
+            if (map.getLayer("mask") && lowest) map.moveLayer("mask", lowest);     // shading under all of them
+            C.ready = true;
+            const row = root.querySelector(`.rv-ctx-row[data-ctx="${C.key}"]`), head = root.querySelector(".rv-ctx-group");
+            if (row) row.hidden = false;
+            if (head) head.hidden = false;
+            if (C.L.visible) placeLabels();
+          }).catch(() => {});
       });
     }
     let started = false;
@@ -407,6 +667,7 @@
       map.addLayer({ id: "boundary-halo", type: "line", source: "boundary", paint: { "line-color": "#0b1612", "line-width": 5, "line-opacity": 0.45 } });
       map.addLayer({ id: "boundary", type: "line", source: "boundary", paint: { "line-color": "#ffffff", "line-width": 2, "line-dasharray": [3, 2] } });
       if (refWanted) addReference();
+      if (CTX.length) addContext();
       if (m.mask) {
         // shade the land outside the property: the whole world with the property cut out of it
         fetch(url(m.boundary)).then((r) => r.json()).then((fc) => {
@@ -481,7 +742,7 @@
         if (toolMode === "measure") return;           // the measure tool has its own click handler
         if (picking) return pickAt(e);
         const f = map.queryRenderedFeatures(box(e.point, 8), { layers: targetIds() });
-        if (!f.length) { clearSelection(); closeSheet(); return; }
+        if (!f.length) { clearSelection(); closeSheet(); photoState.leave(); return; }   // away from a photo: back to the overview
         const s = f.find((x) => x.layer.id === "sugg");
         if (s) return showSuggestion(s);
         const list = stack(f, e.point);
@@ -575,7 +836,7 @@
       const cls = classLabel(L, p);
       const icon = L.draw ? `<img alt="" src="${legendIcon((L.draw.colors || [])[p._cls || 0] || "#e8590c", L.draw.type === "direction")}">`
         : p._cls != null && L.legend[p._cls] ? `<img alt="" src="${esc(url(L.legend[p._cls].icon))}">` : "";
-      const title = p._label || cls || L.title;
+      const title = featureTitle(L, p, cls);
       const rows = (L.fields || []).filter((f) => p[f.name] !== undefined && p[f.name] !== null && p[f.name] !== "");
       let html = `<div class="rv-pop">${pager || ""}<div class="rv-pop-kicker">${icon}<span>${esc(L.title)}${cls && cls !== title ? " · " + esc(cls) : ""}</span></div>`;
       html += `<div class="rv-pop-title">${esc(title)}</div>`;
@@ -643,15 +904,43 @@
       }
       const x = (x0 + x1) / 2, y = y0 + (y1 - y0) * 0.78;
       const still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      map.easeTo({ ...view, offset: [x - W / 2, y - H / 2], duration: still ? 0 : 1300, essential: true });
+      map.easeTo({ ...view, offset: [x - W / 2, y - H / 2], duration: still ? 0 : 1300, essential: true, freezeElevation: true });
     }
+    // With the hills on, the camera's height is measured from the ground where it looks. Just after 3D is switched on that
+    // ground is not known until its elevation tile arrives (MapLibre says sea level), so wait for it, briefly, then stand there.
+    function onGround(at, go) {
+      if (!map.getTerrain()) return go();
+      let done = false, timer = null;
+      const run = (force) => {
+        if (done) return;
+        const g = map.queryTerrainElevation(at);
+        if (!g && force !== true) return;
+        done = true; clearTimeout(timer); map.off("data", run);
+        if (g) map.jumpTo({ elevation: g });
+        go();
+      };
+      map.on("data", run);
+      timer = setTimeout(() => run(true), 2500);
+      run();
+    }
+    const photoState = photoViewState({
+      get: () => ({ center: map.getCenter(), zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch() }),
+      threeD: () => threeD,
+      setThreeD: (on) => { setThreeD(on, true); if (!photoState.active()) storeSet("rv-3d", on ? "1" : ""); },   // the way back is saved
+      look: (view) => onGround(view.center, () => lookFrom(view)),
+      move: (camera) => {
+        const still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        map.easeTo({ ...camera, duration: still ? 0 : 900, essential: true, freezeElevation: true });
+      },
+      whole: () => map.fitBounds(m.bounds, wholeView(pad())),
+    });
     // the details card for a photo view: fixed in the top right corner, styled like a popup, without a pointer
     function floatCard(html) {
       const box = el("div", { class: "rv-floatpop" });
       box.innerHTML = `<div class="maplibregl-popup-content"><button type="button" class="maplibregl-popup-close-button" aria-label="Close popup">×</button>${html}</div>`;
       mapEl.appendChild(box);
       const card = { remove: () => box.remove(), getElement: () => box };
-      box.querySelector(".maplibregl-popup-close-button").addEventListener("click", () => { if (popup === card) popup = null; card.remove(); select(null); });
+      box.querySelector(".maplibregl-popup-close-button").addEventListener("click", () => { if (popup === card) popup = null; card.remove(); select(null); photoState.leave(); });
       return card;
     }
     function showDetails(html, lngLat, ctx, view) {
@@ -659,20 +948,21 @@
       if (narrow()) {
         const body = openSheet(html);
         wire(body, ctx);
-        if (view) requestAnimationFrame(() => lookFrom(view));
+        if (view) requestAnimationFrame(() => photoState.enter(view)); else photoState.leave();
       } else if (view) {
         closeSheet();
         popup = floatCard(html);
         wire(popup.getElement(), ctx);
-        lookFrom(view);
+        photoState.enter(view);
       } else {
         closeSheet();
-        popup = new maplibregl.Popup({ maxWidth: "340px", offset: 12 }).setLngLat(lngLat).setHTML(html).addTo(map);
+        const backing = photoState.leave();           // something else picked: back out of a photo's view first
+        popup =new maplibregl.Popup({ maxWidth: "340px", offset: 12 }).setLngLat(lngLat).setHTML(html).addTo(map);
         popup.on("close", () => { select(null); popup = null; });
         wire(popup.getElement(), ctx);
         // keep the whole popup on screen (photos make it tall)
         const fitPopup = () => {
-          if (!popup) return;
+          if (!popup || backing) return;              // a pan now would stop the way back
           const r = popup.getElement().getBoundingClientRect(), c = map.getContainer().getBoundingClientRect();
           const dy = r.top < c.top + 10 ? r.top - c.top - 10 : r.bottom > c.bottom - 10 ? r.bottom - c.bottom + 10 : 0;
           const dx = r.left < c.left + 370 ? r.left - c.left - 370 : r.right > c.right - 60 ? r.right - c.right + 60 : 0;
@@ -687,7 +977,7 @@
     const sheet = el("section", { class: "rv-sheet", role: "dialog", "aria-label": "Details", hidden: "" });
     sheet.innerHTML = `<button type="button" class="rv-sheet-close" aria-label="Close">×</button><div class="rv-sheet-body"></div>`;
     root.appendChild(sheet);
-    sheet.querySelector(".rv-sheet-close").addEventListener("click", () => { closeSheet(); clearSelection(); cancelPick(); });
+    sheet.querySelector(".rv-sheet-close").addEventListener("click", () => { closeSheet(); clearSelection(); cancelPick(); photoState.leave(); });
     function openSheet(html) {
       const body = sheet.querySelector(".rv-sheet-body");
       body.innerHTML = html;
@@ -702,12 +992,12 @@
 
     function lightbox(src) {
       const lb = el("div", { class: "rv-lightbox", role: "dialog", "aria-label": "Photo" });
-      lb.innerHTML = `<img alt="Photo" src="${esc(src)}"><button class="rv-btn" type="button">Close</button>`;
-      const close = () => { lb.remove(); document.removeEventListener("keydown", onKey); };
-      const onKey = (e) => { if (e.key === "Escape") close(); };
-      lb.addEventListener("click", (e) => { if (e.target === lb || e.target.tagName === "BUTTON") close(); });
-      document.addEventListener("keydown", onKey);
-      root.appendChild(lb);
+      lb.innerHTML = `<img alt="Photo" src="${esc(src)}"><button class="rv-lightbox-close" type="button" aria-label="Close photo"><span aria-hidden="true">×</span>Close</button>`;
+      lightboxWire(lb, document);
+      // on the page itself, not inside the viewer: a page that holds the viewer under its own header (the farm platform)
+      // would otherwise draw that header over the close button
+      document.body.appendChild(lb);
+      lb.querySelector(".rv-lightbox-close").focus();
     }
 
     // ---------------------------------------------------------------- suggestions
@@ -832,6 +1122,7 @@
     // ---------------------------------------------------------------- labels
     const labelLayers = layers.filter((L) => L.labels && L.features);
     REFS.forEach((R) => labelLayers.push(R.L));          // last: the property's own labels win
+    CTX.forEach((C) => { if (C.labels) labelLayers.push(C.L); });
     let labelsOn = true;
     const labelBox = el("div", { class: "rv-labels", "aria-hidden": "true" });
     mapEl.insertBefore(labelBox, mapEl.querySelector(".maplibregl-control-container"));   // under controls and popups
@@ -978,6 +1269,8 @@
     }
     const LINE_REPEAT = 450;                                // a long road or river is named again about every 450 px
     const SAME_GAP = 300;                                   // ... but never within 300 px of the same name (braided rivers)
+    const AREA_GAP = 640;                                   // a context area, drawn in tile pieces, is named once in about this much
+    const POINT_GAP = 160;                                  // and points of the same name close together (a town's bores) once
     const REPEAT = 340;                                     // big areas show their label again about every 340 px
     function placeLabels() {
       const t0 = performance.now();
@@ -1009,13 +1302,81 @@
         labelData[R.id] = out.sort((a, b) => b.size - a.size).slice(0, 200);   // the longest first, enough for one screen
       });
     }
+    // names on the context layers that are on, from the tiles already loaded for this view: areas (a piece per tile, the
+    // same name never written twice close together), lines joined up by name, points
+    function ctxLabels() {
+      const z = map.getZoom();
+      CTX.forEach((C) => {
+        if (!C.labels) return;
+        labelData[C.id] = [];
+        if (!C.ready || !layerOn(C.L) || z < C.labels.minzoom - 0.25) return;
+        const out = [], lines = {}, seenPart = new Set();
+        if (C.labels.sourceLayer) {
+          // CL3: one point per area (the build's <key>-labels): named once, centred; a point a tile repeats (its edge) once
+          map.querySourceFeatures(C.src, { sourceLayer: C.labels.sourceLayer }).forEach((f) => {
+            const p = f.properties || {}, g = f.geometry;
+            let t = contextText(C.labels.text, p);
+            if (!t || !g || g.type !== "Point") return;
+            if (C.labels.upper) t = t.toUpperCase();
+            const c = g.coordinates, k = t + "|" + c[0].toFixed(3) + "," + c[1].toFixed(3);
+            if (seenPart.has(k)) return;
+            seenPart.add(k);
+            out.push({ text: t, type: "Point", bbox: [c[0], c[1], c[0], c[1]], coords: c, near: "area",
+              r: typeof p.label_r === "number" ? p.label_r : null, color: colourFor(C.labels.colorBy, p) });
+          });
+          out.sort((a, b) => (b.r || 0) - (a.r || 0));
+          // a big area whose point is out of sight (a zone seen close up) is named once, on the roomiest part of it in view
+          const vb = map.getBounds(), w = vb.getWest(), s = vb.getSouth(), e = vb.getEast(), n = vb.getNorth();
+          const pr = panel.getBoundingClientRect(), mr = mapEl.getBoundingClientRect();
+          const left = !printing && !narrow() && !panel.classList.contains("collapsed") ? Math.max(0, pr.right - mr.left) : 0;
+          const shown = new Set(out.filter((o) => { const q = map.project(o.coords); return q.x >= left && q.x <= mapEl.clientWidth && q.y >= 0 && q.y <= mapEl.clientHeight; })
+            .map((o) => o.text));
+          const best = {};
+          map.querySourceFeatures(C.src, { sourceLayer: C.sourceLayer }).forEach((f) => {
+            const p = f.properties || {}, g = f.geometry;
+            let t = contextText(C.labels.text, p);
+            if (!t || !g || !/Polygon$/.test(g.type)) return;
+            if (C.labels.upper) t = t.toUpperCase();
+            if (shown.has(t)) return;
+            (g.type === "Polygon" ? [g.coordinates] : g.coordinates).forEach((c) => {
+              if (!c[0] || c[0].length < 4) return;
+              const bb = bboxOf(c), seen = Math.max(0, Math.min(bb[2], e) - Math.max(bb[0], w)) * Math.max(0, Math.min(bb[3], n) - Math.max(bb[1], s));
+              if (seen > 0 && (!best[t] || seen > best[t].seen)) best[t] = { text: t, type: "Polygon", bbox: bb, raw: c, coords: c, near: true, once: true, seen,
+                color: colourFor(C.labels.colorBy, p) };
+            });
+          });
+          labelData[C.id] = out.slice(0, 300).concat(Object.values(best));
+          return;
+        }
+        map.querySourceFeatures(C.src, { sourceLayer: C.sourceLayer }).forEach((f) => {
+          const t = contextText(C.labels.text, f.properties || {}), g = f.geometry;
+          if (!t || !g) return;
+          const parts = /^Multi/.test(g.type) ? g.coordinates.map((c) => [g.type.slice(5), c]) : [[g.type, g.coordinates]];
+          parts.forEach(([type, c]) => {
+            const k = t + type + JSON.stringify(type === "Point" ? c : type === "Polygon" ? [c[0][0], c[0].length] : [c[0], c[c.length - 1]]);
+            if (seenPart.has(k)) return;                          // the same piece from a neighbouring tile
+            seenPart.add(k);
+            if (type === "Polygon" && c[0] && c[0].length > 3) out.push({ text: t, type: "Polygon", bbox: bboxOf(c), raw: c, coords: c, near: true });
+            else if (type === "LineString" && c.length > 1) (lines[t] = lines[t] || []).push(c);
+            else if (type === "Point") out.push({ text: t, type: "Point", bbox: [c[0], c[1], c[0], c[1]], coords: c, near: "point" });
+          });
+        });
+        Object.entries(lines).forEach(([t, ps]) => joinLines(ps).forEach((c) => {
+          const bb = bboxOf(c);
+          out.push({ text: t, type: "Line", bbox: bb, coords: c.length <= 300 ? c : c.filter((_, i) => i % Math.ceil(c.length / 280) === 0 || i === c.length - 1) });
+        }));
+        const size = (f) => (f.bbox[2] - f.bbox[0]) + (f.bbox[3] - f.bbox[1]);
+        labelData[C.id] = out.sort((a, b) => size(b) - size(a)).slice(0, 300);
+      });
+    }
     let refTimer = null;
     map.on("sourcedata", (e) => {
-      if (!REFS.some((R) => R.src === e.sourceId) || !e.tile) return;
+      if (!REFS.concat(CTX).some((R) => R.src === e.sourceId) || !e.tile) return;
       clearTimeout(refTimer); refTimer = setTimeout(placeLabels, 350);
     });
     function placeLabelsNow() {
       refLabels();
+      ctxLabels();
       labelBox.innerHTML = ""; placed = [];
       if (!labelsOn || !labelLayers.length) return;
       const z = map.getZoom(), b = map.getBounds(), W = mapEl.clientWidth, H = mapEl.clientHeight;
@@ -1030,8 +1391,21 @@
         const size = st.size || 12;
         labelData[L.id].forEach((f) => {
           if (f.bbox[2] < b.getWest() || f.bbox[0] > b.getEast() || f.bbox[3] < b.getSouth() || f.bbox[1] > b.getNorth()) return;
-          const tw = f.text.length * size * 0.58 + 6, th = size * 1.3;
+          let tw = f.text.length * size * 0.58 + 6, th = size * 1.3;
+          if (st.upper || st.spacing) tw = f.text.length * size * ((st.upper ? 0.7 : 0.58) + (st.spacing || 0)) + 6;
+          if (st.padding) { tw += st.padding * 2; th += st.padding * 2; }        // room kept clear around it
           let at = null, weight = 0, alts = null;
+          if (f.near === "area") {
+            // an area's one label point: centred on it, and only where the area is big enough on screen to hold its name
+            const q = map.project(f.coords);
+            if (q.x < x0 || q.x > x1 || q.y < y0 || q.y > y1) return;
+            if (f.r != null) {
+              const mpp = (40075016.686 * Math.cos((f.coords[1] * Math.PI) / 180)) / (512 * Math.pow(2, z));
+              if (f.r / mpp < size * 0.55) return;
+            }
+            cands.push({ L, f, at: [q.x, q.y], alts: null, tw, th, weight: f.r || 0, st, order });
+            return;
+          }
           if (f.type === "Polygon" && terrain3d) {
             // 3D: each area's own best spot (worked out once), so moving the view stays quick
             if (!f.pole) {
@@ -1058,7 +1432,7 @@
             // roomiest spot of its own patch, so no stretch of it is left without a name
             let mx = Infinity, my = Infinity, Mx = -Infinity, My = -Infinity;
             outer.forEach(([x, y]) => { mx = Math.min(mx, x); my = Math.min(my, y); Mx = Math.max(Mx, x); My = Math.max(My, y); });
-            if (Math.max(Mx - mx, My - my) > REPEAT * 0.9) {                // long or big on screen
+            if (!f.once && Math.max(Mx - mx, My - my) > REPEAT * 0.9) {     // long or big on screen (an area named once: not again)
               const a0 = map.project([f.bbox[0], f.bbox[3]]);           // grid fixed to the area, steady as you pan
               const got = [[pole.x, pole.y]], need = Math.max(th * 0.8, tw * 0.35), spots = [];
               for (let gx = Math.floor((mx - a0.x) / REPEAT) * REPEAT + a0.x; gx < Mx; gx += REPEAT) {
@@ -1087,8 +1461,9 @@
               const len = cum[cum.length - 1];
               if (len < tw + 4) return;
               const spots = [len / 2];
-              for (let d = len / 2 + LINE_REPEAT; d < len - tw / 2; d += LINE_REPEAT) spots.push(d);
-              for (let d = len / 2 - LINE_REPEAT; d > tw / 2; d -= LINE_REPEAT) spots.push(d);
+              const rep = st.repeat || LINE_REPEAT;               // a context layer's "symbol-spacing" names it less often
+              for (let d = len / 2 + rep; d < len - tw / 2; d += rep) spots.push(d);
+              for (let d = len / 2 - rep; d > tw / 2; d -= rep) spots.push(d);
               spots.forEach((d, k) => {
                 const fit = alongLine(run, cum, d, tw, th);
                 if (fit) cands.push({ L, f, at: fit.at, ang: fit.ang, alts: null, tw, th, weight: len, st, order, again: k > 0, line: true });
@@ -1123,27 +1498,29 @@
       };
       cands.forEach((c) => {
         const nameKey = c.L.id + "\u0000" + c.f.text;
-        if (c.line && (sameName[nameKey] || []).some((q) => Math.hypot(q[0] - c.at[0], q[1] - c.at[1]) < SAME_GAP)) return;
+        const apart = c.line || c.f.near;
+        if (apart && (sameName[nameKey] || []).some((q) => Math.hypot(q[0] - c.at[0], q[1] - c.at[1]) < (c.f.near === "point" ? POINT_GAP : c.f.near ? AREA_GAP : Math.max(SAME_GAP, (c.st.repeat || 0) * 0.7)))) return;
         let box = null;
         for (const at of c.alts || [c.at]) {
           const b2 = { cx: at[0], cy: at[1], hw: c.tw / 2, hh: c.th / 2, ang: c.ang || 0 };
           if (free(b2) && seen(c, at)) { box = b2; c.at = at; break; }
         }
         if (!box) return;
-        if (c.line) (sameName[nameKey] = sameName[nameKey] || []).push(c.at);
+        if (apart) (sameName[nameKey] = sameName[nameKey] || []).push(c.at);
         const e = document.createElement("span");
         e.className = "rv-label";
         e.textContent = c.f.text;
         const hex = (v) => (/^#[0-9a-f]{3,8}$/i.test(String(v || "")) ? v : null);     // colours from the package: hex only
-        const colour = hex(c.st.color);
+        const colour = hex(c.f.color) || hex(c.st.color);                        // a context label may take its area's own hue
         const halo = hex(c.st.halo) || (colour && parseInt(colour.slice(1, 3), 16) > 160 ? "#000000" : "#ffffff");
         e.style.cssText = `font-size:${Math.min(Math.max(+c.st.size || 12, 6), 48)}px;color:${colour || "#1b1b1b"};font-weight:${c.st.bold ? 700 : 600};`
-          + `${c.st.italic ? "font-style:italic;" : ""}text-shadow:0 0 2px ${halo},0 0 2px ${halo},0 0 3px ${halo},0 0 4px ${halo};`;
+          + `${c.st.italic ? "font-style:italic;" : ""}text-shadow:0 0 2px ${halo},0 0 2px ${halo},0 0 3px ${halo},0 0 4px ${halo};`
+          + (c.st.spacing ? `letter-spacing:${c.st.spacing}em;` : "");
         e.style.transform = `translate(${c.at[0]}px,${c.at[1]}px) translate(-50%,-50%)` + (c.ang ? ` rotate(${c.ang.toFixed(1)}deg)` : "");
         labelBox.appendChild(e);
         placed.push({ box, e, lnglat: map.unproject(c.at), ang: c.ang || 0, bearing: map.getBearing(),
           text: c.f.text, at: c.at.slice(), colour: colour || "#1b1b1b", halo, size: Math.min(Math.max(+c.st.size || 12, 6), 48),
-          bold: !!c.st.bold, italic: !!c.st.italic });
+          bold: !!c.st.bold, italic: !!c.st.italic, spacing: c.st.spacing || 0 });
       });
     }
     // while the map moves, labels move with it; once it stops they're placed again for what's on screen
@@ -1250,9 +1627,7 @@
       row.innerHTML = `<div class="rv-layer-row"><label for="${cid}"><input id="${cid}" class="rv-switch" type="checkbox" ${L.visible ? "checked" : ""}><span>${esc(L.title)}</span></label>${count}</div>`;
       let legend = L.legend || [];
       if (L.draw) {
-        const colors = L.draw.colors && L.draw.colors.length ? L.draw.colors : ["#e8590c"];
-        legend = legend.length > 1 ? legend.map((g, i) => ({ label: g.label, src: legendIcon(colors[i] || colors[0], L.draw.type === "direction") }))
-          : [{ label: L.draw.type === "direction" ? "Photo, cone shows the view" : "", src: legendIcon(colors[0], L.draw.type === "direction") }];
+        legend = drawLegend(L).map((g) => ({ label: g.label, src: legendIcon(g.color, L.draw.type === "direction") }));
       } else legend = legend.map((g) => ({ label: g.label, src: url(g.icon) }));
       if (legend.length > 1 || (legend.length === 1 && legend[0].label && L.draw)) {
         row.innerHTML += `<ul class="rv-legend">${legend.map((g) => `<li><img alt="" src="${esc(g.src)}"><span>${esc(g.label)}</span></li>`).join("")}</ul>`;
@@ -1303,6 +1678,27 @@
         });
       });
     }
+    if (CTX.length) {
+      body.appendChild(el("div", { class: "rv-group rv-ctx-group", hidden: "" }, "Context layers"));
+      CTX.forEach((C) => {                                    // in the order given
+        const row = el("div", { class: "rv-layer rv-ctx-row" + (C.L.visible ? "" : " off"), hidden: "" });
+        row.dataset.ctx = C.key;
+        const one = C.legend.length === 1 ? `<img alt="" src="${contextIcon(C.legend[0])}" style="width:20px;height:20px">` : "";
+        row.innerHTML = `<div class="rv-layer-row"><label for="rv-l-${C.id}"><input id="rv-l-${C.id}" class="rv-switch" type="checkbox" ${C.L.visible ? "checked" : ""}>${one}<span>${esc(C.title)}</span></label><span class="rv-count"></span></div>`
+          + (C.legend.length > 1 ? `<ul class="rv-legend">${C.legend.map((g) => `<li><img alt="" src="${contextIcon(g)}"><span>${esc(g.label)}</span></li>`).join("")}</ul>` : "")
+          + (C.note ? `<div class="rv-ref-note">${esc(C.note)}</div>` : "")
+          + (C.credit ? `<div class="rv-ref-note">${esc(C.credit)}</div>` : "");
+        row.dataset.from = 0; row.dataset.count = "";
+        body.appendChild(row);
+        row.querySelector("input").addEventListener("change", (e) => {
+          const on = e.target.checked;
+          C.L.visible = on; storeSet(C.store, on ? "1" : "0");
+          row.classList.toggle("off", !on);
+          (mapIds[C.id] || []).forEach((id) => map.getLayer(id) && map.setLayoutProperty(id, "visibility", on ? "visible" : "none"));
+          placeLabels();
+        });
+      });
+    }
     if (maskRow) body.appendChild(maskRow);                // after the layers
     if (labelLayers.length) {
       const row = el("div", { class: "rv-layer rv-mask-row" });
@@ -1319,7 +1715,10 @@
     }));
 
     const fit = el("button", { class: "rv-btn rv-fit", type: "button" }, "Whole property");
-    fit.addEventListener("click", () => map.fitBounds(m.bounds, { padding: pad() }));
+    fit.addEventListener("click", () => {
+      if (photoState.end()) clearSelection();      // out of a photo's view, its card closed, 3D as the person had it
+      map.fitBounds(m.bounds, wholeView(pad()));
+    });
     root.appendChild(fit);
     if (suggest) {
       const sb = el("button", { class: "rv-btn rv-suggest-btn", type: "button" }, '<span aria-hidden="true">＋</span> Suggest a change');
@@ -1376,6 +1775,7 @@
       return [pool[1], pool[0]];                                                 // QGIS order: top layer on the right
     }
     function startCompare() {
+      photoState.end();
       if (threeD) setThreeD(false);
       clearSelection(); closeSheet();
       let [left, right] = compareDefaults();
@@ -1572,10 +1972,8 @@
     }
     function legendFor(L) {
       if (L.draw) {
-        const colors = L.draw.colors && L.draw.colors.length ? L.draw.colors : ["#e8590c"];
-        const lg = L.legend || [];
-        return lg.length > 1 ? lg.map((g, i) => ({ label: g.label, src: legendIcon(colors[i] || colors[0], L.draw.type === "direction") }))
-          : [{ label: "", src: legendIcon(colors[0], L.draw.type === "direction") }];
+        const lg = drawLegend(L);
+        return lg.map((g) => ({ label: lg.length > 1 ? g.label : "", src: legendIcon(g.color, L.draw.type === "direction") }));
       }
       return (L.legend || []).map((g) => ({ label: g.label, src: url(g.icon) }));
     }
@@ -1592,10 +1990,8 @@
     function legendFor(L, present) {
       let items;
       if (L.draw) {
-        const colors = L.draw.colors && L.draw.colors.length ? L.draw.colors : ["#e8590c"];
-        const lg = L.legend || [];
-        items = lg.length > 1 ? lg.map((g, i) => ({ i, label: g.label, src: legendIcon(colors[i] || colors[0], L.draw.type === "direction") }))
-          : [{ i: 0, label: "", src: legendIcon(colors[0], L.draw.type === "direction") }];
+        const lg = drawLegend(L);
+        items = lg.map((g) => ({ i: g.i, label: lg.length > 1 ? g.label : "", src: legendIcon(g.color, L.draw.type === "direction") }));
       } else items = (L.legend || []).map((g, i) => ({ i, label: g.label, src: url(g.icon) }));
       if (present && items.length > 1) items = items.filter((g) => present.has(g.i));
       return items;
@@ -1621,6 +2017,11 @@
         const items = R.classes.filter(([k]) => have.has(k)).map(([, label, c, w, o]) => ({ label, src: lineIcon(c, w, Object.assign({ casing: c === "#f2f2f2" ? "#777" : undefined }, o)) }));
         if (items.length) blocks.push({ title: R.title, items });
       });
+      CTX.forEach((C) => {
+        if (!C.ready || !layerOn(C.L) || !C.legend.length) return;
+        if (C.legend.length === 1) blocks.push({ title: C.title, icon: contextIcon(C.legend[0]), items: [] });
+        else blocks.push({ title: C.title, items: C.legend.map((g) => ({ label: g.label, src: contextIcon(g) })) });
+      });
       return blocks;
     }
     function paintLabels(g, k, list) {                               // the labels placed for print, into the picture
@@ -1631,6 +2032,7 @@
         g.translate(p.at[0] * k, p.at[1] * k);
         if (p.ang) g.rotate((p.ang * Math.PI) / 180);
         g.font = `${p.italic ? "italic " : ""}${p.bold ? 700 : 600} ${p.size * k}px ${fam}`;
+        if (p.spacing && "letterSpacing" in g) g.letterSpacing = `${p.spacing * p.size * k}px`;
         g.strokeStyle = p.halo; g.lineWidth = 3.2 * k; g.globalAlpha = 0.9; g.strokeText(p.text, 0, 0);
         g.globalAlpha = 1; g.fillStyle = p.colour; g.fillText(p.text, 0, 0);
         g.restore();
@@ -1700,7 +2102,7 @@
         const meta = [property, m.survey_date ? "Surveyed " + fmtDate(m.survey_date) : ""].filter(Boolean).join(" · ");
         const bmOn = ["aerial", "map"].find((k) => map.getLayoutProperty("bm-" + k, "visibility") !== "none");
         const credits = [bmOn ? String(BASEMAPS[bmOn].attribution || "").replace(/<[^>]*>/g, "") : "",
-          ...REFS.filter((R) => R.ready && layerOn(R.L)).map((R) => R.credit), threeD ? "Elevation: LINZ" : ""].filter(Boolean).join(" · ");
+          ...REFS.filter((R) => R.ready && layerOn(R.L)).map((R) => R.credit), ...CTX.filter((C) => C.ready && layerOn(C.L)).map((C) => C.credit), threeD ? "Elevation: LINZ" : ""].filter(Boolean).join(" · ");
         const segs = sc ? [0, 1, 2, 3].map((i) => `<rect x="${(i * sc.mm) / 4}" y="0" width="${sc.mm / 4}" height="1.6" fill="${i % 2 ? "#fff" : "#1b2a24"}" stroke="#1b2a24" stroke-width=".25"/>`).join("") : "";
         const scale = sc ? `<div class="rv-pl-scale"><svg width="${sc.mm + 2}mm" height="2.2mm" viewBox="-1 -0.3 ${sc.mm + 2} 2.2">${segs}</svg>
             <div class="rv-pl-ticks" style="width:${sc.mm}mm"><span>0</span><span>${sc.half}</span><span>${sc.full} ${sc.unit}</span></div>
@@ -1770,6 +2172,6 @@
     }));
   }
 
-  const RCLViewer = { mount, mergeShared, rasterParts, terrain: null, stats: {} };
+  const RCLViewer = { mount, mergeShared, referenceDefs, contextDefs, contextText, rasterParts, featureTitle, drawLegend, wholeView, photoViewState, lightboxWire, terrain: null, stats: {} };
   window.RCLViewer = RCLViewer;
 })();
