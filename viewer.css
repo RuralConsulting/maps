@@ -95,9 +95,16 @@ button, input { font: inherit; color: inherit; }
 .rv-pop dd { margin: 0; overflow-wrap: anywhere; }
 .rv-pop-more { font-size: 12px; color: var(--ink-3); margin-top: 6px; }
 
-.rv-lightbox { position: fixed; inset: 0; z-index: 50; background: rgba(8, 12, 10, 0.88); display: flex; align-items: center; justify-content: center; padding: 24px; }
+.rv-lightbox { position: fixed; inset: 0; z-index: 1000; background: rgba(8, 12, 10, 0.88); display: flex; align-items: center; justify-content: center;
+  padding: 72px 16px 16px; }
 .rv-lightbox img { max-width: 100%; max-height: 100%; border-radius: 6px; }
-.rv-lightbox button { position: absolute; top: 14px; right: 14px; }
+/* white with a dark ring in both themes, above the photo (not over it), clear of a phone's notch */
+.rv-lightbox-close { position: absolute; z-index: 1; top: max(14px, env(safe-area-inset-top)); right: max(14px, env(safe-area-inset-right));
+  display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 18px 0 14px; border: 0; border-radius: 999px;
+  background: #fff; color: #1b2a24; font: 600 15px/1 var(--f-ui); cursor: pointer;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.45), 0 4px 16px rgba(0, 0, 0, 0.5); }
+.rv-lightbox-close span { font-size: 24px; font-weight: 500; }
+.rv-lightbox-close:focus-visible { outline: 3px solid #fec956; outline-offset: 2px; }
 .rv-toggle-panel { display: none; }
 .rv-brand { display: block; }
 .rv-logo { height: 26px; width: auto; display: block; }
@@ -198,11 +205,16 @@ button, input { font: inherit; color: inherit; }
   will-change: transform; }
 
 /* 3D button (top right, under the compass) */
-.rv-3d button { width: 29px; height: 29px; font: 700 12px/29px var(--f-ui); color: #333; }
+/* the 3D and tool buttons take their ink from their group, as MapLibre's own buttons do; a page that themes the control
+   groups (the farm platform's dark theme) colours them with the rest. Faint only when really disabled. */
+.rv-3d, .rv-tools { color: #333; }
+.rv-3d button, .rv-tools button { color: inherit; }
+.rv-3d button:disabled, .rv-tools button:disabled { opacity: .35; cursor: not-allowed; }
+.rv-3d button { width: 29px; height: 29px; font: 700 12px/29px var(--f-ui); }
 .maplibregl-ctrl-group.rv-3d button[aria-pressed="true"] { background-color: var(--brand); color: var(--brand-ink); }
 
 /* tools: compare, measure, print (top right, under 3D) */
-.rv-tools button { width: 29px; height: 29px; display: grid; place-items: center; color: #333; }
+.rv-tools button { width: 29px; height: 29px; display: grid; place-items: center; }
 .rv-tools svg { width: 18px; height: 18px; }
 .maplibregl-ctrl-group.rv-tools button[aria-pressed="true"] { background-color: var(--brand); color: var(--brand-ink); --btnbg: var(--brand); }
 .rv-toolbar { position: absolute; z-index: 9; top: 12px; left: 50%; transform: translateX(calc(-50% + 176px));
