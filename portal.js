@@ -460,7 +460,20 @@
     }
     if (!myRole.role) return false;
     const { data: lvl } = await sb.auth.mfa.getAuthenticatorAssuranceLevel();
-    if (lvl && lvl.currentLevel === "aal2") return false;
+    if (lvl && lvl.currentLevel === "aal2") {
+      // The database ends staff powers 30 days after the sign-in (staff_role), and would then show this person
+      // an empty customer list. Send them to sign in again instead.
+      if (staff) return false;
+      const { data: live, error } = await sb.rpc("staff_role");
+      if (error) return false;          // couldn't ask: carry on, the lists below report their own errors
+      if (typeof live === "string" && live) { staff = live; return false; }
+      await sb.auth.signOut({ scope: "local" });       // this browser only: QGIS and other devices stay as they are
+      resetStaff(); cache = null;
+      document.title = "Farm maps | Rural Consulting";
+      show("screen-signin");
+      msg("It's more than 30 days since you signed in. Sign in again to see the maps.");
+      return true;
+    }
     await showMfa(session);
     return true;
   }
